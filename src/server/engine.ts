@@ -1,0 +1,1109 @@
+import { NormalizedTrade, OrderBook, Liquidation } from './exchanges/types';
+import { BaseExchangeConnector } from './exchanges/base';
+import { BinanceConnector } from './exchanges/binance';
+import { BybitConnector } from './exchanges/bybit';
+import { CoinbaseConnector } from './exchanges/coinbase';
+import { HyperliquidConnector } from './exchanges/hyperliquid';
+import { OkxConnector } from './exchanges/okx';
+import { Alert } from './detectors/types';
+import { AbsorptionDetector } from './detectors/absorption';
+import { DivergenceDetector } from './detectors/divergence';
+import { ExhaustionDetector } from './detectors/exhaustion';
+import { SpikeDetector } from './detectors/spike';
+import { VelocityDetector } from './detectors/velocity';
+import { TwapDetector } from './detectors/twap';
+import { LiquidationDetector } from './detectors/liquidation';
+import { MetricsCalculator } from './metrics';
+import { TrendAnalyzer } from './trendAnalyzer';
+import { CandleBuilder, Candle as CandleBuilderCandle } from './candles/candleBuilder';
+import { MarketStructureAnalyzer } from './structure/marketStructure';
+import { OrderBlockDetector } from './structure/orderBlocks';
+import { FairValueGapDetector } from './structure/fairValueGaps';
+import { LiquidityDetector } from './structure/liquidity';
+import { VWAPCalculator } from './profile/vwap';
+import { VolumeProfileCalculator } from './profile/volumeProfile';
+import { OpenInterestTracker } from './derivatives/openInterest';
+import { FundingRateMonitor } from './derivatives/fundingRate';
+import { BasisTracker } from './derivatives/basis';
+import type { DerivativesState } from './derivatives/types';
+import { ConfluenceEngine } from './scenarios/confluenceEngine';
+import type { ConfluenceSignal } from './scenarios/types';
+
+type BroadcastFn = (type: string, data: unknown) => void;
+
+// Circular buffer for trades
+class CircularBuffer<T> {
+  private buffer: T[] = [];
+  private maxSize: number;
+
+  constructor(maxSize: number) {
+    this.maxSize = maxSize;
+  }
+
+  push(item: T) {
+    this.buffer.push(item);
+    if (this.buffer.length > this.maxSize) {
+      this.buffer.shift();
+    }
+  }
+
+  pushMany(items: T[]) {
+    for (const item of items) this.push(item);
+  }
+
+  getAll(): T[] {
+    return this.buffer;
+  }
+
+  getRecent(ms: number): T[] {
+    const cutoff = Date.now() - ms;
+    return this.buffer.filter((t: any) => t.timestamp >= cutoff);
+  }
+
+  get length(): number {
+    return this.buffer.length;
+  }
+
+  clear() {
+    this.buffer = [];
+  }
+}
+
+export function startEngine(config: any, broadcast: BroadcastFn) {
+  console.log('[ENGINE] Starting order flow engine...');
+
+  const tradeBuffer = new CircularBuffer<NormalizedTrade>(100000);
+  const liquidationBuffer = new CircularBuffer<Liquidation>(10000);
+  const orderBooks = new Map<string, OrderBook>();
+
+  // Initialize detectors
+  const detectors = {
+    absorption: new AbsorptionDetector(config.detectors.absorption),
+    divergence: new DivergenceDetector(config.detectors.divergence),
+    exhaustion: new ExhaustionDetector(config.detectors.exhaustion),
+    spike: new SpikeDetector(config.detectors.spike),
+    velocity: new VelocityDetector(config.detectors.velocity),
+    twap: new TwapDetector(config.detectors.twap),
+    liquidation: new LiquidationDetector(config.detectors.liquidation),
+  };
+
+  const metrics = new MetricsCalculator();
+  const trendAnalyzer = new TrendAnalyzer();
+
+  // ── Phase A: Structure Analysis & VWAP ──
+  const structureConfig = config.structure || {};
+  const vwapConfig = config.vwap || {};
+
+  // Multi-timeframe candle builder (aggregated across all exchanges)
+  const candleBuilder = new CandleBuilder({ maxCandles: 1500 });
+
+  // Market structure analyzers per timeframe
+  const structureAnalyzers = new Map<string, MarketStructureAnalyzer>();
+  const structureTimeframes: Record<string, { lookback: number }> = {
+    '1m':  { lookback: structureConfig.lookback1m  ?? 3 },
+    '5m':  { lookback: structureConfig.lookback5m  ?? 5 },
+    '15m': { lookback: structureConfig.lookback15m ?? 5 },
+  };
+
+  for (const [tf, cfg] of Object.entries(structureTimeframes)) {
+    const analyzer = new MarketStructureAnalyzer(
+      { lookback: cfg.lookback },
+      {
+        minDisplacementATR: structureConfig.minDisplacementATR ?? 1.5,
+        atrPeriod: structureConfig.atrPeriod ?? 14,
+      },
+      tf,
+    );
+    structureAnalyzers.set(tf, analyzer);
+  }
+
+  // VWAP calculator
+  const vwapCalculator = new VWAPCalculator({
+    sessionResetHour: vwapConfig.sessionResetHour ?? 0,
+    showBands: vwapConfig.showBands ?? true,
+  });
+
+  // ── Phase B: Order Blocks, FVGs, Liquidity, Volume Profile ──
+  const obConfig = config.orderBlocks || {};
+  const fvgConfig = config.fvg || {};
+  const liqConfig = config.liquidity || {};
+  const vpConfig = config.volumeProfile || {};
+
+  // Order Block detectors per timeframe
+  const obDetectors = new Map<string, OrderBlockDetector>();
+  for (const tf of Object.keys(structureTimeframes)) {
+    obDetectors.set(tf, new OrderBlockDetector({
+      minDisplacementATR: obConfig.minDisplacementATR ?? 1.5,
+      requireFVG: obConfig.requireFVG ?? false,
+      maxActiveOBs: obConfig.maxActiveOBs ?? 50,
+      autoRemoveMitigated: obConfig.autoRemoveMitigated ?? true,
+    }, tf));
+  }
+
+  // FVG detectors per timeframe
+  const fvgDetectors = new Map<string, FairValueGapDetector>();
+  for (const tf of Object.keys(structureTimeframes)) {
+    fvgDetectors.set(tf, new FairValueGapDetector({
+      minSizeATR: fvgConfig.minSizeATR ?? 0.3,
+      trackFilling: fvgConfig.trackFilling ?? true,
+      maxActiveFVGs: fvgConfig.maxActiveFVGs ?? 60,
+    }, tf));
+  }
+
+  // Liquidity detectors per timeframe
+  const liqDetectors = new Map<string, LiquidityDetector>();
+  for (const tf of Object.keys(structureTimeframes)) {
+    liqDetectors.set(tf, new LiquidityDetector({
+      equalLevelThreshold: liqConfig.equalLevelThreshold ?? 0.05,
+      minTouches: liqConfig.minTouches ?? 2,
+      sweepConfirmationCandles: liqConfig.sweepConfirmationCandles ?? 3,
+    }, tf));
+  }
+
+  // Volume Profile calculator
+  const volumeProfile = new VolumeProfileCalculator({
+    numBins: vpConfig.numBins ?? 50,
+    valueAreaPercent: vpConfig.valueAreaPercent ?? 70,
+    sessionResetHour: vpConfig.sessionResetHour ?? 0,
+  });
+
+  // ── Phase C: Derivatives (OI, Funding, Basis) ──
+  const derivConfig = config.derivatives || {};
+
+  const oiTracker = new OpenInterestTracker({
+    pollIntervalMs: derivConfig.oiPollIntervalMs ?? 10000,
+    alertThresholdPercent: derivConfig.oiAlertThresholdPercent ?? 2,
+    windowMinutes: derivConfig.oiWindowMinutes ?? 5,
+  });
+
+  const fundingMonitor = new FundingRateMonitor({
+    pollIntervalMs: derivConfig.fundingPollIntervalMs ?? 30000,
+    extremePositiveThreshold: derivConfig.fundingExtremePositive ?? 0.0005,
+    extremeNegativeThreshold: derivConfig.fundingExtremeNegative ?? -0.0003,
+    flipDetection: derivConfig.fundingFlipDetection ?? true,
+  });
+
+  const basisTracker = new BasisTracker({
+    updateIntervalMs: derivConfig.basisUpdateIntervalMs ?? 1000,
+    extremeThresholdPercent: derivConfig.basisExtremeThresholdPercent ?? 0.1,
+    crossExchangeDivergencePercent: derivConfig.basisDivergencePercent ?? 0.05,
+  });
+
+  // Wire derivative alerts
+  const emitDerivAlert = (type: string, msg: string, details: any) => {
+    broadcast('alert', {
+      id: `DERIV-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      type,
+      market: 'AGGREGATE',
+      exchange: details.exchange || 'ALL',
+      symbol: config.symbol || 'BTC',
+      timestamp: Date.now(),
+      message: msg,
+      details,
+    });
+  };
+
+  // Start OI and funding pollers
+  oiTracker.start();
+  fundingMonitor.start();
+
+  // ── Phase D: Confluence Engine ──
+  const conflConfig = config.confluence || {};
+  const confluenceEngine = new ConfluenceEngine({
+    weights: conflConfig.weights || undefined,
+    minScoreForScenario: conflConfig.minScoreForScenario ?? 30,
+    highPriorityThreshold: conflConfig.highPriorityThreshold ?? 55,
+    extremePriorityThreshold: conflConfig.extremePriorityThreshold ?? 75,
+    signalTimeWindowMs: conflConfig.signalTimeWindowMs ?? 300000,
+    scenarioExpirationMs: conflConfig.scenarioExpirationMs ?? 1800000,
+    maxActiveScenarios: conflConfig.maxActiveScenarios ?? 5,
+    minRiskReward: conflConfig.minRiskReward ?? 1.5,
+    slBufferPercent: conflConfig.slBufferPercent ?? 0.1,
+  });
+
+  confluenceEngine.onScenario((event, scenario) => {
+    broadcast(event, scenario);
+  });
+
+  // Helper: feed a signal into the confluence engine
+  function feedConfluence(signal: ConfluenceSignal) {
+    confluenceEngine.addSignal(signal);
+  }
+
+  // Wire derivative alerts (after confluence engine so we can feed them)
+  oiTracker.onAlert((alert) => {
+    emitDerivAlert('OI', `${alert.type} — ${alert.exchange} — OI ${alert.oiChangePercent > 0 ? '+' : ''}${alert.oiChangePercent.toFixed(1)}% | ${alert.interpretation}`, alert);
+    feedConfluence({
+      type: alert.type,
+      direction: alert.oiChangePercent > 0 && alert.priceChangePercent > 0 ? 'LONG'
+        : alert.oiChangePercent > 0 && alert.priceChangePercent < 0 ? 'SHORT'
+        : alert.oiChangePercent < 0 && alert.priceChangePercent > 0 ? 'LONG' // short squeeze
+        : 'SHORT', // long squeeze
+      price: confluenceEngine['currentPrice'] || 0,
+      timestamp: Date.now(),
+      details: { description: alert.interpretation },
+    });
+  });
+
+  fundingMonitor.onAlert((alert) => {
+    emitDerivAlert('FUNDING', `${alert.type} — ${alert.exchange} — Rate ${(alert.currentRate * 100).toFixed(4)}% | ${alert.interpretation}`, alert);
+    feedConfluence({
+      type: 'FUNDING_EXTREME',
+      direction: alert.currentRate > 0 ? 'SHORT' : 'LONG', // high funding = bearish, negative = bullish
+      price: confluenceEngine['currentPrice'] || 0,
+      timestamp: Date.now(),
+      details: { description: alert.interpretation },
+    });
+  });
+
+  basisTracker.onAlert((alert) => {
+    emitDerivAlert('BASIS', `${alert.type} — ${alert.description}`, alert);
+    feedConfluence({
+      type: 'BASIS_EXTREME',
+      direction: alert.exchanges?.[0]?.basisPercent > 0 ? 'SHORT' : 'LONG',
+      price: confluenceEngine['currentPrice'] || 0,
+      timestamp: Date.now(),
+      details: { description: alert.description },
+    });
+  });
+
+  // Listen for candle close events from the multi-TF builder
+  candleBuilder.on('candle:close', (tf: string, candle: CandleBuilderCandle) => {
+    const analyzer = structureAnalyzers.get(tf);
+    if (!analyzer) return;
+
+    const candles = candleBuilder.getCandles(tf);
+    const breaks = analyzer.onCandleClose(candles);
+
+    // ── Phase B: FVG detection on every candle close ──
+    const fvgDetector = fvgDetectors.get(tf);
+    if (fvgDetector) {
+      const fvg = fvgDetector.onCandleClose(candles);
+      if (fvg) {
+        broadcast('alert', {
+          id: `FVG-ALERT-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          type: 'FVG',
+          market: 'AGGREGATE',
+          exchange: 'ALL',
+          symbol: config.symbol || 'BTC',
+          timestamp: Date.now(),
+          message: `${fvg.type} FVG — ${tf} — Gap $${fvg.low.toFixed(0)}-$${fvg.high.toFixed(0)} (${fvg.sizePercent.toFixed(3)}%)`,
+          details: { fvg },
+        });
+        // Phase D: feed FVG into confluence
+        feedConfluence({
+          type: 'FVG',
+          direction: fvg.type === 'BULLISH' ? 'LONG' : 'SHORT',
+          price: (fvg.low + fvg.high) / 2,
+          zoneLow: fvg.low,
+          zoneHigh: fvg.high,
+          timeframe: tf,
+          timestamp: Date.now(),
+          details: { description: `${fvg.type} FVG $${fvg.low.toFixed(0)}-$${fvg.high.toFixed(0)}` },
+        });
+      }
+      // Update fill tracking
+      fvgDetector.updateFilling(candle.high, candle.low);
+    }
+
+    // ── Phase B: Liquidity pool updates ──
+    const liqDetector = liqDetectors.get(tf);
+    if (liqDetector) {
+      const state = analyzer.getState();
+      liqDetector.updatePools(state.swingHighs, state.swingLows);
+      const sweep = liqDetector.checkSweeps(candles);
+      if (sweep) {
+        broadcast('alert', {
+          id: `SWEEP-ALERT-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          type: 'LIQUIDITY_SWEEP',
+          market: 'AGGREGATE',
+          exchange: 'ALL',
+          symbol: config.symbol || 'BTC',
+          timestamp: Date.now(),
+          message: `${sweep.type} — ${tf} — Swept $${sweep.pool.level.toFixed(0)} (depth: $${sweep.sweepDepth.toFixed(0)})`,
+          details: { sweep },
+        });
+        // Phase D: feed sweep into confluence
+        feedConfluence({
+          type: 'LIQUIDITY_SWEEP',
+          direction: sweep.type === 'BUYSIDE_SWEEP' ? 'SHORT' : 'LONG', // sweep buyside = reversal short
+          price: sweep.pool.level,
+          timeframe: tf,
+          timestamp: Date.now(),
+          details: { description: `${sweep.type} — $${sweep.pool.level.toFixed(0)}` },
+        });
+      }
+    }
+
+    // Broadcast structure breaks as alerts + trigger OB detection
+    for (const brk of breaks) {
+      const msg = `${brk.type} ${brk.direction} — ${tf} — Price ${brk.type === 'BOS' ? 'broke' : 'reversed'} through $${brk.price.toLocaleString()} (close: $${brk.breakPrice.toLocaleString()})`;
+      broadcast('alert', {
+        id: `STRUCTURE-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        type: 'STRUCTURE',
+        market: 'AGGREGATE',
+        exchange: 'ALL',
+        symbol: config.symbol || 'BTC',
+        timestamp: Date.now(),
+        message: msg,
+        details: {
+          structureType: brk.type,
+          direction: brk.direction,
+          timeframe: tf,
+          swingPrice: brk.price,
+          breakPrice: brk.breakPrice,
+        },
+      });
+
+      // Phase D: feed structure break into confluence
+      const brkDir: 'LONG' | 'SHORT' = brk.direction === 'BULLISH' ? 'LONG' : 'SHORT';
+      feedConfluence({
+        type: brk.type, // 'BOS' or 'CHoCH'
+        direction: brkDir,
+        price: brk.breakPrice,
+        timeframe: tf,
+        timestamp: Date.now(),
+        details: { description: `${brk.type} ${brk.direction} — ${tf}` },
+      });
+
+      // ── Phase B: Order Block detection on structure break ──
+      const obDetector = obDetectors.get(tf);
+      if (obDetector) {
+        const activeFVGs = fvgDetector ? fvgDetector.getActiveFVGs() : [];
+        const ob = obDetector.onStructureBreak(brk, candles, activeFVGs);
+        if (ob) {
+          broadcast('alert', {
+            id: `OB-ALERT-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            type: 'ORDER_BLOCK',
+            market: 'AGGREGATE',
+            exchange: 'ALL',
+            symbol: config.symbol || 'BTC',
+            timestamp: Date.now(),
+            message: `${ob.type} OB — ${tf} — $${ob.low.toFixed(0)}-$${ob.high.toFixed(0)} (strength: ${ob.strength})`,
+            details: { orderBlock: ob },
+          });
+          // Phase D: feed OB into confluence
+          feedConfluence({
+            type: 'ORDER_BLOCK',
+            direction: ob.type === 'BULLISH' ? 'LONG' : 'SHORT',
+            price: (ob.low + ob.high) / 2,
+            zoneLow: ob.low,
+            zoneHigh: ob.high,
+            strength: ob.strength / 5,
+            timeframe: tf,
+            timestamp: Date.now(),
+            details: { description: `${ob.type} OB $${ob.low.toFixed(0)}-$${ob.high.toFixed(0)}` },
+          });
+        }
+      }
+    }
+
+    // ── Phase B: Update OB lifecycle with current price ──
+    const obDetector = obDetectors.get(tf);
+    if (obDetector) {
+      obDetector.updateLifecycle(candle.close, candle.close);
+    }
+  });
+
+  // Handle incoming trades
+  function onTrade(trade: NormalizedTrade) {
+    tradeBuffer.push(trade);
+    metrics.onTrade(trade);
+    trendAnalyzer.onTrade(trade);
+
+    // Run detectors
+    const trades = tradeBuffer.getRecent(120000); // last 2 min
+    const alerts: Alert[] = [];
+
+    if (config.detectors.absorption.enabled) {
+      const a = detectors.absorption.detect(trades, trade);
+      if (a) alerts.push(a);
+    }
+    if (config.detectors.divergence.enabled) {
+      const a = detectors.divergence.detect(trades, trade);
+      if (a) alerts.push(...a);
+    }
+    if (config.detectors.exhaustion.enabled) {
+      const a = detectors.exhaustion.detect(trades, trade);
+      if (a) alerts.push(a);
+    }
+    if (config.detectors.spike.enabled) {
+      const a = detectors.spike.detect(trades, trade);
+      if (a) alerts.push(a);
+    }
+    if (config.detectors.velocity.enabled) {
+      const a = detectors.velocity.detect(trades, trade);
+      if (a) alerts.push(a);
+    }
+    if (config.detectors.twap.enabled) {
+      const a = detectors.twap.detect(trades, trade);
+      if (a) alerts.push(a);
+    }
+
+    for (const alert of alerts) {
+      trendAnalyzer.onAlert(alert);
+      broadcast('alert', alert);
+
+      // Phase D: feed detector alerts into confluence
+      const alertType = alert.type || '';
+      let dir: 'LONG' | 'SHORT' = 'LONG';
+      // Infer direction from alert details
+      if (alertType === 'ABSORPTION') {
+        dir = (alert as any).details?.dominantSide === 'SELL' ? 'LONG' : 'SHORT';
+      } else if (alertType === 'SPIKE') {
+        dir = (alert as any).message?.includes('Buy') ? 'LONG' : 'SHORT';
+      } else if (alertType === 'VELOCITY') {
+        dir = (alert as any).message?.includes('Buy') ? 'LONG' : 'SHORT';
+      } else if (alertType === 'EXHAUSTION') {
+        dir = 'LONG'; // exhaustion = reversal opportunity
+      } else if (alertType === 'DIVERGENCE') {
+        dir = (alert as any).message?.includes('Bullish') ? 'LONG' : 'SHORT';
+      } else if (alertType === 'TWAP') {
+        dir = (alert as any).message?.includes('buying') ? 'LONG' : 'SHORT';
+      } else if (alertType === 'LIQUIDATION') {
+        // Liquidation cascade = counter-trade opportunity
+        dir = (alert as any).message?.includes('LONG') ? 'SHORT' : 'LONG';
+      }
+
+      feedConfluence({
+        type: alertType,
+        direction: dir,
+        price: trade.price,
+        timestamp: Date.now(),
+        details: { description: (alert as any).message || alertType },
+      });
+    }
+  }
+
+  // Handle order book updates
+  function onOrderBook(book: OrderBook) {
+    const key = `${book.exchange}:${book.market}:${book.symbol}`;
+    orderBooks.set(key, book);
+    trendAnalyzer.onOrderBook(book);
+  }
+
+  // Handle liquidations
+  function onLiquidation(liq: Liquidation) {
+    liquidationBuffer.push(liq);
+    metrics.onLiquidation(liq);
+
+    if (config.detectors.liquidation.enabled) {
+      const liqs = liquidationBuffer.getRecent(60000);
+      const alert = detectors.liquidation.detect(liqs, liq);
+      if (alert) {
+        trendAnalyzer.onAlert(alert);
+        broadcast('alert', alert);
+      }
+    }
+  }
+
+  // Initialize exchange connectors
+  const connectors: BaseExchangeConnector[] = [];
+
+  if (config.exchanges.binance?.enabled) {
+    const c = new BinanceConnector(config.exchanges.binance);
+    c.on('trade', onTrade);
+    c.on('orderbook', onOrderBook);
+    c.on('liquidation', onLiquidation);
+    connectors.push(c);
+  }
+  if (config.exchanges.bybit?.enabled) {
+    const c = new BybitConnector(config.exchanges.bybit);
+    c.on('trade', onTrade);
+    c.on('orderbook', onOrderBook);
+    c.on('liquidation', onLiquidation);
+    connectors.push(c);
+  }
+  if (config.exchanges.coinbase?.enabled) {
+    const c = new CoinbaseConnector(config.exchanges.coinbase);
+    c.on('trade', onTrade);
+    c.on('orderbook', onOrderBook);
+    connectors.push(c);
+  }
+  if (config.exchanges.hyperliquid?.enabled) {
+    const c = new HyperliquidConnector(config.exchanges.hyperliquid);
+    c.on('trade', onTrade);
+    c.on('orderbook', onOrderBook);
+    connectors.push(c);
+  }
+  if (config.exchanges.okx?.enabled) {
+    const c = new OkxConnector(config.exchanges.okx);
+    c.on('trade', onTrade);
+    c.on('orderbook', onOrderBook);
+    connectors.push(c);
+  }
+
+  // Connect all exchanges
+  for (const connector of connectors) {
+    connector.connect();
+  }
+
+  // Batch broadcast: send aggregated data to frontend every 100ms
+  setInterval(() => {
+    // Broadcast recent trades (aggregated)
+    const recentTrades = tradeBuffer.getRecent(1000);
+    if (recentTrades.length > 0) {
+      broadcast('trades', recentTrades);
+    }
+
+    // Broadcast order books
+    const books: Record<string, any> = {};
+    for (const [key, book] of orderBooks) {
+      books[key] = {
+        exchange: book.exchange,
+        market: book.market,
+        symbol: book.symbol,
+        bids: Array.from(book.bids.entries()).sort((a, b) => b[0] - a[0]).slice(0, 25),
+        asks: Array.from(book.asks.entries()).sort((a, b) => a[0] - b[0]).slice(0, 25),
+        lastUpdate: book.lastUpdate,
+      };
+    }
+    if (Object.keys(books).length > 0) {
+      broadcast('orderbooks', books);
+    }
+  }, 100);
+
+  // Broadcast metrics every second
+  setInterval(() => {
+    broadcast('metrics', metrics.getMetrics());
+  }, 1000);
+
+  // Broadcast trend analysis every 2 seconds
+  setInterval(() => {
+    broadcast('trend', trendAnalyzer.analyze());
+  }, 2000);
+
+  // ── OHLC Candle Builder (1-minute candles per exchange) ──
+  interface Candle {
+    time: number;  // seconds (start of the minute)
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+  }
+
+  // Store candles per exchange key — keep last 1500 candles (25 hours)
+  const candlesByExchange = new Map<string, Map<number, Candle>>();
+  const MAX_CANDLES = 1500;
+
+  // ── Fetch historical candles from REST APIs ──
+  async function fetchHistoricalCandles() {
+    const sources = [
+      {
+        key: 'BINANCE_FUTURES:PERP',
+        url: 'https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1m&limit=1500',
+      },
+      {
+        key: 'BINANCE:SPOT',
+        url: 'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=1500',
+      },
+      {
+        key: 'BYBIT:PERP',
+        url: 'https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=1&limit=1000',
+        parser: 'bybit',
+      },
+      {
+        key: 'OKX:PERP',
+        url: 'https://www.okx.com/api/v5/market/candles?instId=BTC-USDT-SWAP&bar=1m&limit=300',
+        parser: 'okx',
+      },
+    ];
+
+    for (const src of sources) {
+      try {
+        const res = await fetch(src.url);
+        if (!res.ok) { console.log(`[CANDLES] Failed to fetch ${src.key}: ${res.status}`); continue; }
+        const json = await res.json();
+
+        const candles = new Map<number, Candle>();
+
+        if (src.parser === 'bybit') {
+          // Bybit v5: { result: { list: [[ts, open, high, low, close, volume, turnover], ...] } }
+          const list = json?.result?.list;
+          if (Array.isArray(list)) {
+            for (const k of list) {
+              const time = Math.floor(Number(k[0]) / 1000);
+              candles.set(time, {
+                time,
+                open: parseFloat(k[1]),
+                high: parseFloat(k[2]),
+                low: parseFloat(k[3]),
+                close: parseFloat(k[4]),
+                volume: parseFloat(k[6]) || parseFloat(k[5]), // turnover (USD) or volume
+              });
+            }
+          }
+        } else if (src.parser === 'okx') {
+          // OKX: { data: [[ts, open, high, low, close, vol, volCcy, ...], ...] }
+          const data = json?.data;
+          if (Array.isArray(data)) {
+            for (const k of data) {
+              const time = Math.floor(Number(k[0]) / 1000);
+              candles.set(time, {
+                time,
+                open: parseFloat(k[1]),
+                high: parseFloat(k[2]),
+                low: parseFloat(k[3]),
+                close: parseFloat(k[4]),
+                volume: parseFloat(k[7]) || parseFloat(k[5]), // volCcyQuote or vol
+              });
+            }
+          }
+        } else {
+          // Binance: [[openTime, open, high, low, close, volume, closeTime, quoteVolume, ...], ...]
+          if (Array.isArray(json)) {
+            for (const k of json) {
+              const time = Math.floor(k[0] / 1000);
+              candles.set(time, {
+                time,
+                open: parseFloat(k[1]),
+                high: parseFloat(k[2]),
+                low: parseFloat(k[3]),
+                close: parseFloat(k[4]),
+                volume: parseFloat(k[7]), // quoteAssetVolume = USD volume
+              });
+            }
+          }
+        }
+
+        if (candles.size > 0) {
+          candlesByExchange.set(src.key, candles);
+          console.log(`[CANDLES] Loaded ${candles.size} historical candles for ${src.key}`);
+        }
+      } catch (err: any) {
+        console.log(`[CANDLES] Error fetching ${src.key}: ${err.message}`);
+      }
+    }
+  }
+
+  // Fetch history and seed Phase A modules
+  fetchHistoricalCandles().then(() => {
+    // Seed the multi-TF candle builder with historical 1m data from Binance Futures
+    const binanceFuturesCandles = candlesByExchange.get('BINANCE_FUTURES:PERP');
+    if (binanceFuturesCandles && binanceFuturesCandles.size > 0) {
+      const sorted = Array.from(binanceFuturesCandles.values()).sort((a, b) => a.time - b.time);
+      // Convert to CandleBuilder format (add missing fields with defaults)
+      const enriched: CandleBuilderCandle[] = sorted.map(c => ({
+        time: c.time,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.volume,
+        buyVolume: c.volume * 0.5,   // estimate 50/50 for historical
+        sellVolume: c.volume * 0.5,
+        delta: 0,
+        trades: 0,
+      }));
+      candleBuilder.seedHistorical(enriched);
+      console.log(`[PHASE-A] Seeded CandleBuilder with ${enriched.length} historical 1m candles`);
+
+      // Run structure analysis on historical data
+      for (const [tf, analyzer] of structureAnalyzers.entries()) {
+        const tfCandles = candleBuilder.getCandles(tf);
+        if (tfCandles.length > 0) {
+          analyzer.processHistorical(tfCandles);
+          const state = analyzer.getState();
+          console.log(`[PHASE-A] ${tf} structure: ${state.trend} | ${state.swingHighs.length} swing highs, ${state.swingLows.length} swing lows, ${state.recentBreaks.length} breaks`);
+        }
+      }
+
+      // Seed VWAP with historical candle data
+      vwapCalculator.seedFromCandles(enriched);
+      const vwapData = vwapCalculator.getData();
+      if (vwapData.vwap > 0) {
+        console.log(`[PHASE-A] VWAP seeded: $${vwapData.vwap.toFixed(0)} | +1σ: $${vwapData.upperBand1.toFixed(0)} | -1σ: $${vwapData.lowerBand1.toFixed(0)}`);
+      }
+
+      // ── Phase B: Seed FVGs, OBs, Liquidity, Volume Profile from historical data ──
+      for (const [tf, fvgDetector] of fvgDetectors.entries()) {
+        const tfCandles = candleBuilder.getCandles(tf);
+        if (tfCandles.length > 2) {
+          fvgDetector.processHistorical(tfCandles);
+          console.log(`[PHASE-B] ${tf} FVGs: ${fvgDetector.getActiveFVGs().length} active`);
+        }
+      }
+
+      // Seed liquidity from swing points
+      for (const [tf, liqDetector] of liqDetectors.entries()) {
+        const analyzer = structureAnalyzers.get(tf);
+        if (analyzer) {
+          const state = analyzer.getState();
+          liqDetector.updatePools(state.swingHighs, state.swingLows);
+          console.log(`[PHASE-B] ${tf} Liquidity: ${liqDetector.getActivePools().length} pools`);
+        }
+      }
+
+      // Seed Volume Profile
+      volumeProfile.seedFromCandles(enriched);
+      const vpData = volumeProfile.getData();
+      if (vpData.poc > 0) {
+        console.log(`[PHASE-B] Volume Profile: POC $${vpData.poc.toFixed(0)} | VAH $${vpData.vah.toFixed(0)} | VAL $${vpData.val.toFixed(0)}`);
+      }
+    }
+  });
+
+  function updateCandle(trade: NormalizedTrade) {
+    const key = `${trade.exchange}:${trade.market}`;
+    if (!candlesByExchange.has(key)) {
+      candlesByExchange.set(key, new Map());
+    }
+    const candles = candlesByExchange.get(key)!;
+    const minuteTs = Math.floor(trade.timestamp / 60000) * 60; // seconds
+
+    let candle = candles.get(minuteTs);
+    if (!candle) {
+      candle = {
+        time: minuteTs,
+        open: trade.price,
+        high: trade.price,
+        low: trade.price,
+        close: trade.price,
+        volume: trade.usdValue,
+      };
+      candles.set(minuteTs, candle);
+
+      // Prune old candles
+      if (candles.size > MAX_CANDLES) {
+        const keys = Array.from(candles.keys()).sort((a, b) => a - b);
+        for (let i = 0; i < keys.length - MAX_CANDLES; i++) {
+          candles.delete(keys[i]);
+        }
+      }
+    } else {
+      candle.high = Math.max(candle.high, trade.price);
+      candle.low = Math.min(candle.low, trade.price);
+      candle.close = trade.price;
+      candle.volume += trade.usdValue;
+    }
+  }
+
+  // ── CVD (Cumulative Volume Delta) per minute ──
+  // CVD = cumulative (buyVolume - sellVolume) aligned to 1-minute buckets
+  // We store per-minute delta and compute cumulative on broadcast
+  const cvdPerMinute = new Map<number, number>(); // minuteTs → delta for that minute
+  let cvdRunningTotal = 0; // running total across all minutes
+
+  function updateCvd(trade: NormalizedTrade) {
+    const minuteTs = Math.floor(trade.timestamp / 60000) * 60;
+    const delta = trade.side === 'BUY' ? trade.usdValue : -trade.usdValue;
+
+    const current = cvdPerMinute.get(minuteTs) || 0;
+    cvdPerMinute.set(minuteTs, current + delta);
+
+    // Prune old entries
+    if (cvdPerMinute.size > MAX_CANDLES + 10) {
+      const keys = Array.from(cvdPerMinute.keys()).sort((a, b) => a - b);
+      for (let i = 0; i < keys.length - MAX_CANDLES; i++) {
+        cvdPerMinute.delete(keys[i]);
+      }
+    }
+  }
+
+  function getCvdSeries(): { time: number; value: number }[] {
+    const sorted = Array.from(cvdPerMinute.entries()).sort((a, b) => a[0] - b[0]);
+    const series: { time: number; value: number }[] = [];
+    let cumulative = 0;
+    for (const [time, delta] of sorted) {
+      cumulative += delta;
+      series.push({ time, value: cumulative });
+    }
+    return series;
+  }
+
+  // Hook candle + CVD + Phase A/B/C modules into onTrade
+  const originalOnTrade = onTrade;
+  function onTradeWithCandles(trade: NormalizedTrade) {
+    updateCandle(trade);
+    updateHTFCandle(trade);
+    updateCvd(trade);
+    candleBuilder.onTrade(trade);      // Multi-TF candle builder (triggers structure analysis)
+    vwapCalculator.onTrade(trade);     // VWAP
+    volumeProfile.onTrade(trade);      // Volume Profile
+
+    // ── Phase C: Feed prices to derivatives trackers ──
+    oiTracker.updatePrice(trade.exchange, trade.price);
+    const marketType: 'SPOT' | 'PERP' = trade.market === 'SPOT' ? 'SPOT' : 'PERP';
+    basisTracker.updatePrice(trade.exchange, marketType, trade.price);
+
+    // ── Phase D: Update confluence engine price ──
+    confluenceEngine.updatePrice(trade.price);
+
+    originalOnTrade(trade);
+  }
+
+  // Re-wire connectors to use the new handler
+  for (const connector of connectors) {
+    connector.removeAllListeners('trade');
+    connector.on('trade', onTradeWithCandles);
+  }
+
+  // ── Higher Timeframe candles (1h, 4h) for deeper history ──
+  const htfCandlesByExchange = new Map<string, Map<number, Candle>>();
+
+  // Keep HTF candles updated from real-time trades
+  function updateHTFCandle(trade: NormalizedTrade) {
+    const key = `${trade.exchange}:${trade.market}`;
+    for (const [tf, intervalSec] of [['1h', 3600], ['4h', 14400]] as [string, number][]) {
+      const htfKey = `${key}:${tf}`;
+      if (!htfCandlesByExchange.has(htfKey)) {
+        htfCandlesByExchange.set(htfKey, new Map());
+      }
+      const candles = htfCandlesByExchange.get(htfKey)!;
+      const bucketTime = Math.floor(trade.timestamp / (intervalSec * 1000)) * intervalSec;
+
+      let candle = candles.get(bucketTime);
+      if (!candle) {
+        candle = {
+          time: bucketTime,
+          open: trade.price,
+          high: trade.price,
+          low: trade.price,
+          close: trade.price,
+          volume: trade.usdValue,
+        };
+        candles.set(bucketTime, candle);
+      } else {
+        candle.high = Math.max(candle.high, trade.price);
+        candle.low = Math.min(candle.low, trade.price);
+        candle.close = trade.price;
+        candle.volume += trade.usdValue;
+      }
+    }
+  }
+
+  // Fetch historical 1h and 4h candles from Binance Futures
+  async function fetchHTFHistoricalCandles() {
+    const htfSources = [
+      {
+        key: 'BINANCE_FUTURES:PERP',
+        tf: '1h',
+        url: 'https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=500',
+      },
+      {
+        key: 'BINANCE_FUTURES:PERP',
+        tf: '4h',
+        url: 'https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=4h&limit=500',
+      },
+    ];
+
+    for (const src of htfSources) {
+      try {
+        const res = await fetch(src.url);
+        if (!res.ok) { console.log(`[HTF] Failed to fetch ${src.key}:${src.tf}: ${res.status}`); continue; }
+        const json = await res.json();
+        const htfKey = `${src.key}:${src.tf}`;
+        const candles = new Map<number, Candle>();
+
+        if (Array.isArray(json)) {
+          for (const k of json) {
+            const time = Math.floor(k[0] / 1000);
+            candles.set(time, {
+              time,
+              open: parseFloat(k[1]),
+              high: parseFloat(k[2]),
+              low: parseFloat(k[3]),
+              close: parseFloat(k[4]),
+              volume: parseFloat(k[7]),
+            });
+          }
+        }
+
+        if (candles.size > 0) {
+          htfCandlesByExchange.set(htfKey, candles);
+          console.log(`[HTF] Loaded ${candles.size} historical ${src.tf} candles for ${src.key}`);
+        }
+      } catch (err: any) {
+        console.log(`[HTF] Error fetching ${src.key}:${src.tf}: ${err.message}`);
+      }
+    }
+  }
+
+  // Fetch HTF candles at startup (after 1m candles are loaded)
+  fetchHTFHistoricalCandles();
+
+  // Broadcast FULL candle history + CVD every 30s (reduced from 5s to avoid JSON parse blocking)
+  setInterval(() => {
+    const payload: Record<string, Candle[]> = {};
+    for (const [key, candles] of candlesByExchange) {
+      payload[key] = Array.from(candles.values()).sort((a, b) => a.time - b.time);
+    }
+    broadcast('candles', payload);
+    broadcast('cvd', getCvdSeries());
+
+    // Broadcast HTF candles
+    const htfPayload: Record<string, Record<string, Candle[]>> = {};
+    for (const [htfKey, candles] of htfCandlesByExchange) {
+      const lastColon = htfKey.lastIndexOf(':');
+      const tf = htfKey.slice(lastColon + 1);
+      const exchangeKey = htfKey.slice(0, lastColon);
+      if (!htfPayload[tf]) htfPayload[tf] = {};
+      htfPayload[tf][exchangeKey] = Array.from(candles.values()).sort((a, b) => a.time - b.time);
+    }
+    broadcast('candles_htf', htfPayload);
+  }, 30000);
+
+  // Broadcast only the CURRENT candle + CVD tip every 500ms (reduced from 100ms)
+  setInterval(() => {
+    const payload: Record<string, Candle> = {};
+    for (const [key, candles] of candlesByExchange) {
+      let latest: Candle | null = null;
+      for (const c of candles.values()) {
+        if (!latest || c.time > latest.time) latest = c;
+      }
+      if (latest) payload[key] = latest;
+    }
+    broadcast('candle_tick', payload);
+
+    // CVD tip: just the last point
+    const cvdSeries = getCvdSeries();
+    if (cvdSeries.length > 0) {
+      broadcast('cvd_tick', cvdSeries[cvdSeries.length - 1]);
+    }
+  }, 500);
+
+  // ── Phase A Broadcasts ──
+
+  // Broadcast VWAP every 1 second + feed VWAP context to confluence
+  setInterval(() => {
+    const vwapData = vwapCalculator.getData();
+    if (vwapData.vwap > 0) {
+      broadcast('vwap', vwapData);
+
+      // Phase D: VWAP position context (only emit if price is extended)
+      const price = confluenceEngine['currentPrice'];
+      if (price > 0 && vwapData.lowerBand2 > 0 && vwapData.upperBand2 > 0) {
+        if (price <= vwapData.lowerBand2) {
+          feedConfluence({
+            type: 'VWAP_POSITION',
+            direction: 'LONG',
+            price,
+            timestamp: Date.now(),
+            details: { description: `Price at VWAP -2σ ($${vwapData.lowerBand2.toFixed(0)}) — oversold` },
+          });
+        } else if (price >= vwapData.upperBand2) {
+          feedConfluence({
+            type: 'VWAP_POSITION',
+            direction: 'SHORT',
+            price,
+            timestamp: Date.now(),
+            details: { description: `Price at VWAP +2σ ($${vwapData.upperBand2.toFixed(0)}) — overbought` },
+          });
+        }
+      }
+    }
+  }, 1000);
+
+  // Broadcast market structure state every 2 seconds (includes Phase B zones)
+  setInterval(() => {
+    const structureState: Record<string, any> = {};
+    for (const [tf, analyzer] of structureAnalyzers.entries()) {
+      const state = analyzer.getState();
+      const obDetector = obDetectors.get(tf);
+      const fvgDetector = fvgDetectors.get(tf);
+      const liqDetector = liqDetectors.get(tf);
+
+      structureState[tf] = {
+        trend: state.trend,
+        lastBOS: state.lastBOS,
+        lastCHoCH: state.lastCHoCH,
+        swingHighs: state.swingHighs.slice(0, 20),
+        swingLows: state.swingLows.slice(0, 20),
+        recentBreaks: state.recentBreaks.slice(0, 15),
+        // Phase B zones
+        orderBlocks: obDetector ? obDetector.getActiveOBs().slice(0, 15) : [],
+        fvgs: fvgDetector ? fvgDetector.getActiveFVGs().slice(0, 15) : [],
+        liquidityPools: liqDetector ? liqDetector.getActivePools().slice(0, 10) : [],
+        recentSweeps: liqDetector ? liqDetector.getRecentSweeps() : [],
+      };
+    }
+    broadcast('structure', structureState);
+  }, 2000);
+
+  // Broadcast Volume Profile every 3 seconds + POC context for confluence
+  setInterval(() => {
+    const vpData = volumeProfile.getData();
+    if (vpData.poc > 0) {
+      broadcast('volumeProfile', vpData);
+
+      // Phase D: POC proximity context
+      const price = confluenceEngine['currentPrice'];
+      if (price > 0) {
+        const pocDist = Math.abs(price - vpData.poc) / vpData.poc;
+        if (pocDist < 0.001) { // within 0.1% of POC
+          feedConfluence({
+            type: 'VOLUME_PROFILE',
+            direction: price > vpData.poc ? 'SHORT' : 'LONG', // rejection at POC
+            price,
+            timestamp: Date.now(),
+            details: { description: `Price at POC $${vpData.poc.toFixed(0)}` },
+          });
+        }
+      }
+    }
+  }, 3000);
+
+  // ── Phase C: Broadcast derivatives state every 10 seconds ──
+  setInterval(() => {
+    // Compute basis from latest prices
+    const basisData = basisTracker.compute();
+    basisTracker.checkAlerts();
+
+    const oiAgg = oiTracker.getAggregateOI();
+    const latestOI = oiTracker.getLatestOI();
+    const latestFunding = fundingMonitor.getLatestRates();
+
+    // Build per-exchange snapshots
+    const exchangeKeys = new Set([...latestOI.keys(), ...latestFunding.keys()]);
+    const snapshots: any[] = [];
+    for (const ex of exchangeKeys) {
+      const oi = latestOI.get(ex) || 0;
+      const fundingSnap = latestFunding.get(ex);
+      snapshots.push({
+        exchange: ex,
+        symbol: config.symbol || 'BTC',
+        timestamp: Date.now(),
+        openInterest: oi,
+        fundingRate: fundingSnap?.rate || 0,
+        nextFundingTime: fundingSnap?.nextFundingTime || 0,
+      });
+    }
+
+    // Funding stats
+    let maxFunding = 0, minFunding = 0;
+    for (const snap of latestFunding.values()) {
+      if (snap.rate > maxFunding) maxFunding = snap.rate;
+      if (snap.rate < minFunding) minFunding = snap.rate;
+    }
+
+    const derivState: DerivativesState = {
+      snapshots,
+      aggregateOI: oiAgg.total,
+      aggregateOIChange: oiAgg.change,
+      aggregateOIChangePct: oiAgg.changePct,
+      avgFundingRate: fundingMonitor.getAvgRate(),
+      maxFundingRate: maxFunding,
+      minFundingRate: minFunding,
+      cascadeRisk: fundingMonitor.getCascadeRisk(),
+      basisData,
+      avgBasisPercent: basisTracker.getAvgBasisPercent(),
+      lastUpdate: Date.now(),
+    };
+
+    broadcast('derivatives', derivState);
+  }, 10000);
+
+  // ── Phase D: Scenario lifecycle tick + broadcast every 5 seconds ──
+  setInterval(() => {
+    confluenceEngine.tick();
+    const scenarios = confluenceEngine.getActiveScenarios();
+    broadcast('scenarios', scenarios);
+  }, 5000);
+
+  console.log(`[ENGINE] Started with ${connectors.length} exchange connector(s)`);
+  console.log(`[ENGINE] Phase A active: Structure analysis (${[...structureAnalyzers.keys()].join(', ')}) + VWAP`);
+  console.log(`[ENGINE] Phase B active: Order Blocks, FVGs, Liquidity, Volume Profile`);
+  console.log(`[ENGINE] Phase C active: Open Interest, Funding Rate, Basis/Premium`);
+  console.log(`[ENGINE] Phase D active: Confluence Engine (10 templates, max ${confluenceEngine.getActiveScenarios().length}/${conflConfig.maxActiveScenarios ?? 5} scenarios)`);
+}

@@ -1,0 +1,97 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background-color: #0a0a0a;
+  color: #e0e0e0;
+  font-family: 'JetBrains Mono', 'Source Code Pro', Consolas, monospace;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0a0a0a;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1a2332;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #2a3a52;
+}
+
+/* Signal tag colors */
+.signal-absorption { color: #f59e0b; background-color: rgba(245, 158, 11, 0.15); }
+.signal-divergence { color: #06b6d4; background-color: rgba(6, 182, 212, 0.15); }
+.signal-exhaustion { color: #d946ef; background-color: rgba(217, 70, 239, 0.15); }
+.signal-spike { color: #f97316; background-color: rgba(249, 115, 22, 0.15); }
+.signal-velocity { color: #a855f7; background-color: rgba(168, 85, 247, 0.15); }
+.signal-twap { color: #3b82f6; background-color: rgba(59, 130, 246, 0.15); }
+.signal-liquidation { color: #ef4444; background-color: rgba(239, 68, 68, 0.15); }
+
+/* Market tag */
+.tag-spot {
+  color: #22c55e;
+  border: 1px solid #22c55e;
+  font-size: 0.65rem;
+  padding: 1px 6px;
+  letter-spacing: 0.05em;
+}
+
+.tag-perp {
+  color: #8b5cf6;
+  border: 1px solid #8b5cf6;
+  font-size: 0.65rem;
+  padding: 1px 6px;
+  letter-spacing: 0.05em;
+}
+
+/* Panel borders */
+.panel {
+  border: 1px solid #1a2332;
+  background-color: #0d1117;
+}
+
+/* Tab switch fade in */
+@keyframes tabFadeIn {
+  from { opacity: 0.7; }
+  to { opacity: 1; }
+}
+
+/* Notification pulse on tabs */
+@keyframes notifPulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+
+/* Toast slide-in */
+@keyframes slideInRight {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+@keyframes fadeOut {
+  to { opacity: 0; }
+}
+
+/* LIVE pulse */
+@keyframes livePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}

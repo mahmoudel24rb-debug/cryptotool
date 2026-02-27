@@ -1,0 +1,152 @@
+{
+  "exchanges": {
+    "binance": {
+      "enabled": true,
+      "spot": true,
+      "perp": true
+    },
+    "bybit": {
+      "enabled": true,
+      "spot": true,
+      "perp": true
+    },
+    "coinbase": {
+      "enabled": true,
+      "spot": true,
+      "perp": true
+    },
+    "hyperliquid": {
+      "enabled": true,
+      "spot": false,
+      "perp": true
+    },
+    "okx": {
+      "enabled": true,
+      "spot": true,
+      "perp": true
+    }
+  },
+  "symbol": "BTC",
+  "detectors": {
+    "absorption": {
+      "enabled": true,
+      "windowSeconds": 10,
+      "minVolumeUsd": 500000,
+      "maxPriceMovePct": 0.02
+    },
+    "divergence": {
+      "enabled": true,
+      "windowSeconds": 60,
+      "minCvdChangeUsd": 1000000,
+      "minPriceChangePct": 0.05,
+      "micro": {
+        "enabled": true,
+        "windowSeconds": 30,
+        "minCvdChangeUsd": 100000,
+        "minPriceChangePct": 0.03
+      }
+    },
+    "exhaustion": {
+      "enabled": true,
+      "minPriceDropUsd": 50,
+      "maxVolumeUsd": 100000,
+      "windowSeconds": 30
+    },
+    "spike": {
+      "enabled": true,
+      "lookbackMinutes": 5,
+      "spikeMultiplier": 5,
+      "minSpikeVolumeUsd": 1000000
+    },
+    "velocity": {
+      "enabled": true,
+      "windowSeconds": 3,
+      "minCvdShiftUsd": 2000000,
+      "clusterWindowSeconds": 30,
+      "minClusterCount": 3
+    },
+    "twap": {
+      "enabled": true,
+      "minOccurrences": 5,
+      "sizeVariationPct": 20,
+      "intervalVariationPct": 30
+    },
+    "liquidation": {
+      "enabled": true,
+      "windowSeconds": 60,
+      "minLiquidationUsd": 50000
+    }
+  },
+  "structure": {
+    "lookback1m": 3,
+    "lookback5m": 5,
+    "lookback15m": 5,
+    "minDisplacementATR": 1.5,
+    "atrPeriod": 14
+  },
+  "vwap": {
+    "sessionResetHour": 0,
+    "showBands": true
+  },
+  "orderBlocks": {
+    "minDisplacementATR": 1.5,
+    "requireFVG": false,
+    "maxActiveOBs": 50,
+    "autoRemoveMitigated": true
+  },
+  "fvg": {
+    "minSizeATR": 0.3,
+    "trackFilling": true,
+    "maxActiveFVGs": 60
+  },
+  "liquidity": {
+    "equalLevelThreshold": 0.05,
+    "minTouches": 2,
+    "sweepConfirmationCandles": 3
+  },
+  "volumeProfile": {
+    "numBins": 50,
+    "valueAreaPercent": 70,
+    "sessionResetHour": 0
+  },
+  "derivatives": {
+    "oiPollIntervalMs": 10000,
+    "oiAlertThresholdPercent": 2,
+    "oiWindowMinutes": 5,
+    "fundingPollIntervalMs": 30000,
+    "fundingExtremePositive": 0.0005,
+    "fundingExtremeNegative": -0.0003,
+    "fundingFlipDetection": true,
+    "basisUpdateIntervalMs": 1000,
+    "basisExtremeThresholdPercent": 0.1,
+    "basisDivergencePercent": 0.05
+  },
+  "confluence": {
+    "weights": {
+      "structure": 15,
+      "orderBlock": 20,
+      "fairValueGap": 10,
+      "liquiditySweep": 20,
+      "absorption": 10,
+      "divergence": 8,
+      "spike": 5,
+      "velocity": 5,
+      "twap": 5,
+      "liquidation": 8,
+      "exhaustion": 5,
+      "fundingExtreme": 8,
+      "oiDivergence": 8,
+      "basisExtreme": 5,
+      "vwapPosition": 5,
+      "volumeProfile": 5
+    },
+    "minScoreForScenario": 30,
+    "highPriorityThreshold": 55,
+    "extremePriorityThreshold": 75,
+    "signalTimeWindowMs": 300000,
+    "scenarioExpirationMs": 1800000,
+    "maxActiveScenarios": 5,
+    "minRiskReward": 1.5,
+    "slBufferPercent": 0.1
+  }
+}
