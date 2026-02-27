@@ -20,6 +20,6 @@
       "@client/*": ["src/client/*"]
     }
   },
-  "include": ["src/**/*"],
+  "include": ["src/**/*", "public/charting_library/charting_library.d.ts"],
   "exclude": ["node_modules", "dist"]
 }

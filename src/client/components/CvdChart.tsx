@@ -11,7 +11,7 @@ interface CvdChartProps {
 }
 
 const PADDING_RIGHT = 90;
-const PADDING_BOTTOM = 26;
+const PADDING_BOTTOM = 30;
 const PADDING_LEFT = 10;
 const PADDING_TOP = 12;
 const BG_COLOR = '#131722';
@@ -31,6 +31,7 @@ export default function CvdChart({ cvdData, title }: CvdChartProps) {
 
   const scrollOffsetRef = useRef(0);
   const autoScrollRef = useRef(true);
+  const zoomLevelRef = useRef(1); // 1 = default, >1 = zoomed in, <1 = zoomed out
   const dragRef = useRef<{ active: boolean; startX: number; startOffset: number }>({
     active: false, startX: 0, startOffset: 0,
   });
@@ -79,7 +80,8 @@ export default function CvdChart({ cvdData, title }: CvdChartProps) {
         return;
       }
 
-      candleSpacing = Math.max(6, Math.min(14, Math.floor(chartW / 80)));
+      const baseSpacing = Math.max(6, Math.min(14, Math.floor(chartW / 80)));
+      candleSpacing = baseSpacing * zoomLevelRef.current;
       const maxVisible = Math.max(10, Math.floor(chartW / candleSpacing));
 
       if (autoScrollRef.current) scrollOffsetRef.current = 0;
@@ -147,10 +149,25 @@ export default function CvdChart({ cvdData, title }: CvdChartProps) {
         ctx.fillText(formatCvd(v), PADDING_LEFT + chartW + 8, y + 4);
       }
 
-      // Time labels
-      const timeStep = Math.max(1, Math.floor(visible.length / 8));
-      for (let i = 0; i < visible.length; i += timeStep) {
+      // Time labels — ensure minimum pixel spacing so labels don't overlap
+      const minLabelPx = 80;
+      const labelEvery = Math.max(1, Math.ceil(minLabelPx / candleSpacing));
+      // Align to round time intervals (every 5min, 15min, 1h etc.)
+      const dataSpanSec = visible.length > 1 ? visible[visible.length - 1].time - visible[0].time : 0;
+      const roundIntervals = [60, 300, 900, 1800, 3600, 7200, 14400, 86400];
+      let timeRound = 300; // default 5min rounding
+      for (const ri of roundIntervals) {
+        const pointsPerInterval = ri / 60; // assuming ~1 point per minute
+        if (pointsPerInterval >= labelEvery) { timeRound = ri; break; }
+      }
+
+      let lastLabelX = -Infinity;
+      for (let i = 0; i < visible.length; i++) {
+        // Only draw at round time boundaries
+        if (visible[i].time % timeRound !== 0) continue;
         const x = Math.round(indexToX(i)) + 0.5;
+        if (x - lastLabelX < minLabelPx) continue; // skip if too close
+
         ctx.strokeStyle = GRID_COLOR;
         ctx.lineWidth = 1;
         ctx.beginPath();
@@ -159,10 +176,20 @@ export default function CvdChart({ cvdData, title }: CvdChartProps) {
         ctx.stroke();
 
         const d = new Date(visible[i].time * 1000);
-        const label = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+        const hh = String(d.getUTCHours()).padStart(2, '0');
+        const mm = String(d.getUTCMinutes()).padStart(2, '0');
+        // Show date if zoomed out enough to span multiple days
+        let label = `${hh}:${mm}`;
+        if (dataSpanSec > 86400) {
+          const dd = String(d.getUTCDate()).padStart(2, '0');
+          const mo = String(d.getUTCMonth() + 1).padStart(2, '0');
+          label = `${dd}/${mo} ${hh}:${mm}`;
+        }
         ctx.fillStyle = TEXT_COLOR;
+        ctx.font = `10px ${FONT}`;
         ctx.textAlign = 'center';
         ctx.fillText(label, x, h - 6);
+        lastLabelX = x;
       }
 
       // CVD area fill + line
@@ -296,8 +323,8 @@ export default function CvdChart({ cvdData, title }: CvdChartProps) {
     const onMouseLeave = () => { mouseRef.current = null; dragRef.current.active = false; canvas.style.cursor = 'crosshair'; };
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
-      scrollOffsetRef.current = Math.max(0, scrollOffsetRef.current + Math.sign(e.deltaY) * 3);
-      autoScrollRef.current = scrollOffsetRef.current === 0;
+      const zoomDelta = e.deltaY > 0 ? 0.85 : 1.18; // scroll down = zoom out, up = zoom in
+      zoomLevelRef.current = Math.max(0.3, Math.min(8, zoomLevelRef.current * zoomDelta));
     };
 
     canvas.addEventListener('mousemove', onMouseMove);

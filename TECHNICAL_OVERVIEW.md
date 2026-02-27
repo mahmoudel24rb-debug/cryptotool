@@ -504,7 +504,9 @@ useEffect(() => {
 
 ### Multi-Timeframe Aggregation
 
-The backend stores 1m candles. Higher timeframes (5m, 15m, 1h, 4h) are aggregated **on the frontend** from 1m data:
+The backend stores 1m candles. For **5m and 15m**, candles are aggregated on the frontend from 1m data. For **1h and 4h**, the backend fetches 500 historical candles each from Binance Futures REST API at startup (`GET /fapi/v1/klines`), then continues building them in real-time from the trade stream via `updateHTFCandle()`. The frontend merges backend HTF history with recent 1m aggregation (recent overwrites historical via Map dedup).
+
+Frontend aggregation function:
 
 ```typescript
 function aggregateCandles(candles: Candle[], tfSeconds: number): Candle[] {
@@ -529,14 +531,16 @@ function aggregateCandles(candles: Candle[], tfSeconds: number): Candle[] {
 ### Data Flow to Chart
 
 ```
-Backend (engine.ts)                    Frontend (App.tsx)                Chart.tsx
-┌─────────────────┐                   ┌──────────────────┐           ┌───────────────┐
-│ candlesByExchange│─── WS 'candles'──>│ setCandlesByExch │──props──>│ dataRef.current│
-│ (Map per exchange│    (every 30s)    │ (React state)    │          │ (read by rAF)  │
-│  1500 × 1m each)│                   │                  │          │                │
-│                  │─── WS 'candle_tick│ update last candle│          │ draw() at 60fps│
-│                  │    (every 500ms)  │ in state         │          │                │
-└─────────────────┘                   └──────────────────┘           └───────────────┘
+Backend (engine.ts)                    Frontend (App.tsx)                   Chart.tsx
+┌─────────────────┐                   ┌────────────────────────┐        ┌───────────────┐
+│ candlesByExchange│─── WS 'candles'──>│ candleStoreRef (mutable)│──ref─>│ dataRef.current│
+│ (Map per exchange│    (every 30s)    │ + setCandlesByExch     │        │ (read by rAF)  │
+│  1500 × 1m each)│                   │   (throttled 2/sec)    │        │                │
+│                  │─── WS 'candle_tick│ mutate ref in-place    │        │ draw() at 60fps│
+│                  │    (every 500ms)  │ (zero array copies)    │        │                │
+│ htfCandles       │─── WS 'candles_htf│ setHtfCandles          │──ref─>│ htfRef.current │
+│ (500×1h + 500×4h)│   (every 30s)    │ (React state)          │        │ (merge + cache)│
+└─────────────────┘                   └────────────────────────┘        └───────────────┘
 ```
 
 ### Multi-Exchange Overlay
@@ -575,6 +579,7 @@ All communication between backend and frontend is over a single WebSocket connec
 | 100ms | `trades` | Last 1s of trades | Tape/flow display |
 | 100ms | `orderbooks` | Top bids/asks per exchange | Orderbook heatmap |
 | 500ms | `candle_tick` | Current forming candle per exchange | Real-time chart update |
+| 500ms | `cvd_tick` | Latest CVD data point | Real-time CVD update |
 | 1s | `metrics` | TPM, volume/min, delta, liqs/min | Dashboard KPIs |
 | 1s | `vwap` | VWAP + 4 bands | Chart overlay |
 | 2s | `trend` | Score (-100 to +100), factors | Status bar |
@@ -584,6 +589,7 @@ All communication between backend and frontend is over a single WebSocket connec
 | 10s | `derivatives` | OI, funding, basis aggregate | Derivatives tab |
 | 30s | `candles` | Full candle history per exchange | Chart history sync |
 | 30s | `cvd` | Full CVD series | CVD chart |
+| 30s | `candles_htf` | 1h (500) + 4h (500) candles per exchange | HTF chart history |
 | Event | `alert` | Detector alerts | Alert feed |
 | Event | `scenario:new/update/invalidated` | Real-time scenario events | Scenario updates |
 
@@ -603,13 +609,14 @@ All communication between backend and frontend is over a single WebSocket connec
 ### Historical Initialization Sequence (at startup)
 
 1. Fetch 1500 1m candles from 4 exchange REST APIs
-2. Seed `CandleBuilder` with Binance Futures 1m data → emits historical candle:close events
-3. Run `processHistorical()` on structure analyzers for each timeframe (1m, 5m, 15m)
-4. Seed VWAP from today's session candles
-5. Seed FVG detectors with historical candle data
-6. Seed liquidity pools from initial swing points
-7. Seed volume profile from historical candles
-8. Begin real-time processing from WebSocket streams
+2. Fetch 500 1h + 500 4h candles from Binance Futures REST API (HTF history)
+3. Seed `CandleBuilder` with Binance Futures 1m data → emits historical candle:close events
+4. Run `processHistorical()` on structure analyzers for each timeframe (1m, 5m, 15m)
+5. Seed VWAP from today's session candles
+6. Seed FVG detectors with historical candle data
+7. Seed liquidity pools from initial swing points
+8. Seed volume profile from historical candles
+9. Begin real-time processing from WebSocket streams
 
 ---
 
@@ -650,18 +657,17 @@ WebSocket subscriptions are set up in `App.tsx` and remain active even when swit
 
 This eliminates DOM node overhead and allows 60fps rendering of complex financial data.
 
-### Performance Considerations
+### Performance Optimizations (Implemented)
 
-**Current known issue**: During large price moves, the chart can freeze momentarily because:
-1. The full `candles` broadcast (1500 candles × 6 exchanges = ~500KB JSON) is parsed on the main thread every 30s
-2. The `candle_tick` handler creates array copies via spread (`[...arr]`) for React state immutability, 10x per second across 6 exchanges
-3. React re-renders cascade through the component tree on each state update
+High-frequency data (candle ticks, CVD ticks) uses a **mutable ref + throttled React sync** pattern to avoid main thread blocking:
 
-**Potential optimizations**:
-- Use mutable refs for candle data instead of React state (Chart already reads from refs)
-- Throttle React state sync to 1-2x per second instead of every tick
-- Cache `aggregateCandles()` results instead of recomputing every frame
-- Build time→index lookup maps for overlay line drawing
+1. **Mutable stores**: `candleStoreRef` and `cvdStoreRef` hold candle/CVD arrays as plain mutable refs. Tick handlers mutate these in-place (zero array copies)
+2. **Throttled React sync**: React state (`setCandlesByExchange`, `setCvdData`) is only updated at max 2x/sec via timestamp gating, not on every tick
+3. **Cached aggregation**: `aggregateCandles()` results are cached per frame (cache key = `length-lastTime-tfSec`), avoiding recomputation at 60fps
+4. **O(1) overlay lookups**: A `timeToIdx` Map is built once per data change, replacing O(n) `findIndex` calls for multi-exchange overlay rendering
+5. **Reduced broadcast frequency**: `candle_tick` at 500ms (not 100ms), full `candles` at 30s (not 5s)
+
+The Chart's rAF loop reads exclusively from refs — it never triggers or depends on React re-renders.
 
 ---
 

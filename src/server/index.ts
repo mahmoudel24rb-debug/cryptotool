@@ -24,15 +24,34 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 
 const clients = new Set<WebSocket>();
 
+// Track clients that need full initial sync
+const needsInitialSync = new Set<WebSocket>();
+
 wss.on('connection', (ws) => {
   clients.add(ws);
+  needsInitialSync.add(ws);
   console.log(`[WS] Client connected (${clients.size} total)`);
 
   ws.on('close', () => {
     clients.delete(ws);
+    needsInitialSync.delete(ws);
     console.log(`[WS] Client disconnected (${clients.size} total)`);
   });
 });
+
+/** Send a message to a single client */
+export function sendToClient(ws: WebSocket, type: string, data: unknown) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type, data, timestamp: Date.now() }));
+  }
+}
+
+/** Get clients that need initial sync and clear the flag */
+export function getAndClearInitialSyncClients(): WebSocket[] {
+  const list = Array.from(needsInitialSync);
+  needsInitialSync.clear();
+  return list;
+}
 
 // Broadcast to all connected frontend clients
 export function broadcast(type: string, data: unknown) {
@@ -84,6 +103,6 @@ server.listen(PORT, () => {
 
   // Import and start the engine after server is ready
   import('./engine').then(({ startEngine }) => {
-    startEngine(config, broadcast);
+    startEngine(config, broadcast, sendToClient, getAndClearInitialSyncClients);
   });
 });

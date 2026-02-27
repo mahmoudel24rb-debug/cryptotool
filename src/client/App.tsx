@@ -120,7 +120,7 @@ export default function App() {
     return unsub;
   }, [subscribe]);
 
-  // Candles full history (every 30s — immediate React sync)
+  // Candles full history (sent once on connect — immediate React sync)
   useEffect(() => {
     const unsub = subscribe('candles', (msg) => {
       const data = msg.data as Record<string, any[]>;
@@ -147,6 +147,8 @@ export default function App() {
           arr[arr.length - 1] = candle; // in-place update, zero copy
         } else if ((candle as any).time > last.time) {
           arr.push(candle); // in-place push, zero copy
+          // Prune oldest candles to prevent unbounded memory growth
+          if (arr.length > 5000) arr.splice(0, arr.length - 4500);
         }
       }
 

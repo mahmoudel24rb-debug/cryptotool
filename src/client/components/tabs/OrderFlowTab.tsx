@@ -10,6 +10,17 @@ import Settings from '../Settings';
 export default function OrderFlowTab() {
   const { state, actions } = useGlobalState();
   const [showSettings, setShowSettings] = React.useState(false);
+  const [cvdExpanded, setCvdExpanded] = React.useState(false);
+
+  // ESC key to exit CVD fullscreen
+  React.useEffect(() => {
+    if (!cvdExpanded) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setCvdExpanded(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [cvdExpanded]);
 
   const activeScenarios = state.scenarios.filter(
     (s: any) => s.status === 'PENDING' || s.status === 'ACTIVE'
@@ -17,6 +28,43 @@ export default function OrderFlowTab() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+      {/* CVD Fullscreen overlay */}
+      {cvdExpanded && (
+        <div style={{
+          position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+          zIndex: 100, background: '#0a0a0a',
+          display: 'flex', flexDirection: 'column',
+        }}>
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            padding: '4px 12px', background: '#0d1117', borderBottom: '1px solid #1e293b',
+            flexShrink: 0,
+          }}>
+            <span style={{
+              color: '#787b86', fontSize: 11,
+              fontFamily: "'JetBrains Mono', monospace",
+            }}>
+              CUMULATIVE VOLUME DELTA
+            </span>
+            <button
+              onClick={() => setCvdExpanded(false)}
+              style={{
+                background: 'transparent', border: '1px solid #1e293b',
+                color: '#9ca3af', cursor: 'pointer', padding: '2px 8px',
+                fontSize: 10, fontFamily: "'JetBrains Mono', monospace",
+              }}
+              onMouseEnter={(e) => { (e.target as HTMLElement).style.color = '#22d3ee'; }}
+              onMouseLeave={(e) => { (e.target as HTMLElement).style.color = '#9ca3af'; }}
+            >
+              ESC — EXIT FULLSCREEN
+            </button>
+          </div>
+          <div style={{ flex: 1, minHeight: 0 }}>
+            <CvdChart cvdData={state.cvdData} title="CVD" />
+          </div>
+        </div>
+      )}
+
       {/* Main content */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
         {/* Left: Bids heatmap */}
@@ -44,9 +92,30 @@ export default function OrderFlowTab() {
             />
           </div>
 
-          {/* CVD Chart */}
-          <div style={{ flex: '1.5 1 0%', minHeight: 0, overflow: 'hidden' }}>
+          {/* CVD Chart with expand button */}
+          <div style={{ flex: '1.5 1 0%', minHeight: 0, overflow: 'hidden', position: 'relative' }}>
             <CvdChart cvdData={state.cvdData} title="CVD" />
+            <button
+              onClick={() => setCvdExpanded(true)}
+              title="Fullscreen CVD"
+              style={{
+                position: 'absolute', top: 4, right: 8, zIndex: 10,
+                background: 'rgba(13,17,23,0.8)', border: '1px solid #1e293b',
+                color: '#787b86', cursor: 'pointer', padding: '2px 6px',
+                fontSize: 10, fontFamily: "'JetBrains Mono', monospace",
+                lineHeight: 1,
+              }}
+              onMouseEnter={(e) => {
+                (e.target as HTMLElement).style.color = '#22d3ee';
+                (e.target as HTMLElement).style.borderColor = 'rgba(6,182,212,0.3)';
+              }}
+              onMouseLeave={(e) => {
+                (e.target as HTMLElement).style.color = '#787b86';
+                (e.target as HTMLElement).style.borderColor = '#1e293b';
+              }}
+            >
+              ⛶
+            </button>
           </div>
         </div>
 
