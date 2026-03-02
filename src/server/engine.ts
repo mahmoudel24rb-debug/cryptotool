@@ -241,8 +241,23 @@ export function startEngine(
   // Phase 1.1: Inject TrendAnalyzer into ConfluenceEngine
   confluenceEngine.setTrendProvider(trendAnalyzer);
 
+  // Phase 5: Restore active scenarios from disk (survive restarts)
+  confluenceEngine.loadState();
+  confluenceEngine.startStatePersistence();
+
+  // Graceful shutdown: save state before exit
+  const gracefulShutdown = () => {
+    console.log('[ENGINE] Saving scenario state before shutdown...');
+    confluenceEngine.saveState();
+    process.exit(0);
+  };
+  process.on('SIGTERM', gracefulShutdown);
+  process.on('SIGINT', gracefulShutdown);
+
   confluenceEngine.onScenario((event, scenario) => {
     broadcast(event, scenario);
+    // Save state immediately on any scenario change
+    confluenceEngine.saveState();
   });
 
   // Helper: feed a signal into the confluence engine

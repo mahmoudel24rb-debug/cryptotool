@@ -8,7 +8,7 @@ import {
   SignalContribution,
 } from './types';
 import { matchTemplate, ScenarioTemplate } from './scenarioTemplates';
-import { appendFileSync, mkdirSync, existsSync } from 'fs';
+import { appendFileSync, mkdirSync, existsSync, writeFileSync, readFileSync } from 'fs';
 import { dirname } from 'path';
 
 // ═══════════════════════════════════════════════════════════════
@@ -78,6 +78,8 @@ export const SCENARIO_CONFIG = {
 
   // Phase 4 — Logging
   SCENARIO_LOG_PATH: './data/scenario_outcomes.jsonl',
+  ACTIVE_SCENARIOS_PATH: './data/active_scenarios.json',
+  STATE_SAVE_INTERVAL_MS: 30_000, // save active scenarios every 30s
 };
 
 const DEFAULT_CONFIG: ConfluenceConfig = {
@@ -828,5 +830,78 @@ export class ConfluenceEngine {
     if (this.scenarioCallback) {
       this.scenarioCallback(event, scenario);
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // Phase 5: Active scenario persistence (survive restarts)
+  // ═══════════════════════════════════════════════════════════
+
+  /** Save active scenarios to disk */
+  saveState(): void {
+    try {
+      const filePath = SCENARIO_CONFIG.ACTIVE_SCENARIOS_PATH;
+      const dir = dirname(filePath);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+      const active = this.activeScenarios.filter(s =>
+        s.status === 'PENDING' || s.status === 'ACTIVE' ||
+        s.status === 'TRIGGERED' || s.status === 'TP1_HIT' ||
+        s.status === 'TP2_HIT'
+      );
+
+      writeFileSync(filePath, JSON.stringify({
+        savedAt: Date.now(),
+        scenarios: active,
+      }, null, 2));
+    } catch (err) {
+      console.warn('[SCENARIO] Failed to save active state:', (err as Error).message);
+    }
+  }
+
+  /** Load active scenarios from disk (call once at startup) */
+  loadState(): number {
+    try {
+      const filePath = SCENARIO_CONFIG.ACTIVE_SCENARIOS_PATH;
+      if (!existsSync(filePath)) return 0;
+
+      const raw = readFileSync(filePath, 'utf-8');
+      const data = JSON.parse(raw);
+
+      if (!data.scenarios || !Array.isArray(data.scenarios)) return 0;
+
+      const now = Date.now();
+      let restored = 0;
+
+      for (const sc of data.scenarios) {
+        // Skip if already expired (expiresAt passed while server was down)
+        if ((sc.status === 'PENDING' || sc.status === 'ACTIVE') && sc.expiresAt && now >= sc.expiresAt) {
+          // Log as expired outcome
+          sc.status = 'EXPIRED';
+          sc.exitTime = sc.expiresAt;
+          sc.exitReason = 'Expired during server restart';
+          this.logOutcome(sc);
+          continue;
+        }
+
+        // TP-hit scenarios (TP1_HIT, TP2_HIT) don't expire — always restore
+        this.activeScenarios.push(sc);
+        restored++;
+      }
+
+      if (restored > 0) {
+        console.log(`[SCENARIO] Restored ${restored} active scenario(s) from disk`);
+      }
+
+      return restored;
+    } catch (err) {
+      console.warn('[SCENARIO] Failed to load state:', (err as Error).message);
+      return 0;
+    }
+  }
+
+  /** Start periodic state saving */
+  startStatePersistence(): void {
+    setInterval(() => this.saveState(), SCENARIO_CONFIG.STATE_SAVE_INTERVAL_MS);
+    console.log(`[SCENARIO] State persistence active (every ${SCENARIO_CONFIG.STATE_SAVE_INTERVAL_MS / 1000}s)`);
   }
 }
