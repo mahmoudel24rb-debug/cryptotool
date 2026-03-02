@@ -169,6 +169,7 @@ export default function Chart({
   const vwapRef = useRef(vwapData);
   const structureRef = useRef(structureData);
   const overlayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const drawingRef = useRef(false); // mutex to prevent concurrent draws
 
   // Keep refs in sync
   vwapRef.current = vwapData;
@@ -286,105 +287,113 @@ export default function Chart({
     datafeedRef.current.onRealtimeUpdate();
   }, [candlesByExchange, htfCandles]);
 
-  // ── Redraw structure overlays when data changes (throttled) ──
+  // ── Redraw structure overlays when data changes (throttled to 5s) ──
   useEffect(() => {
     if (!readyRef.current || !widgetRef.current) return;
-    // Throttle overlay redraws to avoid flooding
     if (overlayTimerRef.current) clearTimeout(overlayTimerRef.current);
-    overlayTimerRef.current = setTimeout(() => drawAllOverlays(), 500);
+    overlayTimerRef.current = setTimeout(() => drawAllOverlays(), 5000);
   }, [structureData, vwapData]);
 
-  // ── Draw all overlays ──
-  function drawAllOverlays() {
+  // ── Draw all overlays (async-safe with mutex) ──
+  async function drawAllOverlays() {
     if (!widgetRef.current || !readyRef.current) return;
+    if (drawingRef.current) return; // skip if already drawing
+    drawingRef.current = true;
 
-    const chart = widgetRef.current.activeChart();
-    if (!chart) return;
+    try {
+      const chart = widgetRef.current.activeChart();
+      if (!chart) return;
 
-    // Clear ALL shapes to avoid duplicates from async race conditions
-    try { chart.removeAllShapes(); } catch (_) { /* ignore */ }
-    shapeIdsRef.current = [];
-    const ids = shapeIdsRef.current;
+      // Clear ALL shapes first
+      try { chart.removeAllShapes(); } catch (_) { /* ignore */ }
+      shapeIdsRef.current = [];
+      const ids = shapeIdsRef.current;
 
-    const vwap = vwapRef.current;
-    const structure = structureRef.current;
+      const vwap = vwapRef.current;
+      const structure = structureRef.current;
 
-    // ── VWAP lines ──
-    if (vwap && vwap.vwap > 0) {
+      // Collect all draw promises
+      const draws: Promise<void>[] = [];
       const now = Math.floor(Date.now() / 1000);
-      const dayStart = now - 86400;
-      drawHLine(chart, ids, vwap.vwap, dayStart, now, '#ff9800', 'VWAP');
-      drawHLine(chart, ids, vwap.upperBand1, dayStart, now, 'rgba(255,152,0,0.4)', 'VWAP +1');
-      drawHLine(chart, ids, vwap.lowerBand1, dayStart, now, 'rgba(255,152,0,0.4)', 'VWAP -1');
-      drawHLine(chart, ids, vwap.upperBand2, dayStart, now, 'rgba(255,152,0,0.2)', 'VWAP +2');
-      drawHLine(chart, ids, vwap.lowerBand2, dayStart, now, 'rgba(255,152,0,0.2)', 'VWAP -2');
-    }
 
-    // ── Structure overlays ──
-    if (structure) {
-      const tfKey = Object.keys(structure)[0];
-      const s = tfKey ? structure[tfKey] : null;
-      if (!s) return;
+      // ── VWAP lines ──
+      if (vwap && vwap.vwap > 0) {
+        const dayStart = now - 86400;
+        draws.push(drawHLine(chart, ids, vwap.vwap, dayStart, now, '#ff9800', 'VWAP'));
+        draws.push(drawHLine(chart, ids, vwap.upperBand1, dayStart, now, 'rgba(255,152,0,0.4)', '+1σ'));
+        draws.push(drawHLine(chart, ids, vwap.lowerBand1, dayStart, now, 'rgba(255,152,0,0.4)', '-1σ'));
+        draws.push(drawHLine(chart, ids, vwap.upperBand2, dayStart, now, 'rgba(255,152,0,0.2)', '+2σ'));
+        draws.push(drawHLine(chart, ids, vwap.lowerBand2, dayStart, now, 'rgba(255,152,0,0.2)', '-2σ'));
+      }
 
-      // Order Blocks (limit to 5 most recent unmitigated)
-      if (s.orderBlocks) {
-        let obCount = 0;
-        for (let i = s.orderBlocks.length - 1; i >= 0 && obCount < 5; i--) {
-          const ob = s.orderBlocks[i];
-          if (ob.mitigated) continue;
-          obCount++;
-          const bg = ob.type === 'BULLISH' ? 'rgba(38,166,154,0.15)' : 'rgba(239,83,80,0.15)';
-          const border = ob.type === 'BULLISH' ? '#26a69a' : '#ef5350';
-          const endTime = Math.floor(Date.now() / 1000);
-          drawRect(chart, ids, ob.timestamp, ob.high, endTime, ob.low, bg, border,
-            `OB ${ob.type === 'BULLISH' ? '▲' : '▼'} ${ob.strength}`);
+      // ── Structure overlays ──
+      if (structure) {
+        const tfKey = Object.keys(structure)[0];
+        const s = tfKey ? structure[tfKey] : null;
+        if (s) {
+          // Order Blocks (limit to 5 most recent unmitigated)
+          if (s.orderBlocks) {
+            let obCount = 0;
+            for (let i = s.orderBlocks.length - 1; i >= 0 && obCount < 5; i--) {
+              const ob = s.orderBlocks[i];
+              if (ob.mitigated) continue;
+              obCount++;
+              const bg = ob.type === 'BULLISH' ? 'rgba(38,166,154,0.15)' : 'rgba(239,83,80,0.15)';
+              const border = ob.type === 'BULLISH' ? '#26a69a' : '#ef5350';
+              draws.push(drawRect(chart, ids, ob.timestamp, ob.high, now, ob.low, bg, border,
+                `OB ${ob.type === 'BULLISH' ? '▲' : '▼'} ${ob.strength}`));
+            }
+          }
+
+          // FVGs (limit to 4 most recent unfilled)
+          if (s.fvgs) {
+            let fvgCount = 0;
+            for (let i = s.fvgs.length - 1; i >= 0 && fvgCount < 4; i--) {
+              const fvg = s.fvgs[i];
+              if (fvg.filled) continue;
+              fvgCount++;
+              const bg = fvg.type === 'BULLISH' ? 'rgba(59,130,246,0.1)' : 'rgba(239,83,80,0.1)';
+              const border = fvg.type === 'BULLISH' ? '#3b82f660' : '#ef535060';
+              draws.push(drawRect(chart, ids, fvg.timestamp, fvg.high, now, fvg.low, bg, border,
+                `FVG ${Math.round(fvg.filledPercent)}%`));
+            }
+          }
+
+          // BOS / CHoCH (limit to 5 most recent)
+          if (s.recentBreaks) {
+            for (const brk of s.recentBreaks.slice(-5)) {
+              const label = `${brk.type} ${brk.direction === 'BULLISH' ? '▲' : '▼'}`;
+              const color = brk.direction === 'BULLISH' ? '#26a69a' : '#ef5350';
+              draws.push(drawMarker(chart, ids, brk.timestamp, brk.breakPrice, label, color));
+            }
+          }
+
+          // Liquidity pools (only show strong ones, strength >= 4, limit to 3)
+          if (s.liquidityPools) {
+            let poolCount = 0;
+            for (const pool of s.liquidityPools) {
+              if (pool.swept || pool.strength < 4 || poolCount >= 3) continue;
+              poolCount++;
+              const color = pool.type === 'BUYSIDE' ? '#22d3ee80' : '#f4384880';
+              draws.push(drawHLine(chart, ids, pool.level, now - 7200, now, color,
+                `${pool.type === 'BUYSIDE' ? 'BSL' : 'SSL'} (${pool.strength})`));
+            }
+          }
+
+          // Swing highs/lows (limit to 4 each)
+          for (const sh of (s.swingHighs || []).slice(-4)) {
+            if (!sh.broken) draws.push(drawMarker(chart, ids, sh.timestamp, sh.price, 'SH', '#787b86'));
+          }
+          for (const sl of (s.swingLows || []).slice(-4)) {
+            if (!sl.broken) draws.push(drawMarker(chart, ids, sl.timestamp, sl.price, 'SL', '#787b86'));
+          }
         }
       }
 
-      // FVGs (limit to 4 most recent unfilled)
-      if (s.fvgs) {
-        let fvgCount = 0;
-        for (let i = s.fvgs.length - 1; i >= 0 && fvgCount < 4; i--) {
-          const fvg = s.fvgs[i];
-          if (fvg.filled) continue;
-          fvgCount++;
-          const bg = fvg.type === 'BULLISH' ? 'rgba(59,130,246,0.1)' : 'rgba(239,83,80,0.1)';
-          const border = fvg.type === 'BULLISH' ? '#3b82f660' : '#ef535060';
-          const endTime = Math.floor(Date.now() / 1000);
-          drawRect(chart, ids, fvg.timestamp, fvg.high, endTime, fvg.low, bg, border,
-            `FVG ${Math.round(fvg.filledPercent)}%`);
-        }
-      }
-
-      // BOS / CHoCH (limit to 5 most recent)
-      if (s.recentBreaks) {
-        for (const brk of s.recentBreaks.slice(-5)) {
-          const label = `${brk.type} ${brk.direction === 'BULLISH' ? '▲' : '▼'}`;
-          const color = brk.direction === 'BULLISH' ? '#26a69a' : '#ef5350';
-          drawMarker(chart, ids, brk.timestamp, brk.breakPrice, label, color);
-        }
-      }
-
-      // Liquidity pools (only show strong ones, strength >= 4, limit to 3)
-      if (s.liquidityPools) {
-        let poolCount = 0;
-        for (const pool of s.liquidityPools) {
-          if (pool.swept || pool.strength < 4 || poolCount >= 3) continue;
-          poolCount++;
-          const color = pool.type === 'BUYSIDE' ? '#22d3ee80' : '#f4384880';
-          const now = Math.floor(Date.now() / 1000);
-          drawHLine(chart, ids, pool.level, now - 7200, now, color,
-            `${pool.type === 'BUYSIDE' ? 'BSL' : 'SSL'} (${pool.strength})`);
-        }
-      }
-
-      // Swing highs/lows (limit to 4 each)
-      for (const sh of (s.swingHighs || []).slice(-4)) {
-        if (!sh.broken) drawMarker(chart, ids, sh.timestamp, sh.price, 'SH', '#787b86');
-      }
-      for (const sl of (s.swingLows || []).slice(-4)) {
-        if (!sl.broken) drawMarker(chart, ids, sl.timestamp, sl.price, 'SL', '#787b86');
-      }
+      // Wait for all shapes to be created
+      await Promise.allSettled(draws);
+    } finally {
+      drawingRef.current = false;
     }
   }
 
