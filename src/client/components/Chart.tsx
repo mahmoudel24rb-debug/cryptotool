@@ -301,10 +301,8 @@ export default function Chart({
     const chart = widgetRef.current.activeChart();
     if (!chart) return;
 
-    // Clear previous shapes
-    for (const id of shapeIdsRef.current) {
-      try { chart.removeEntity(id); } catch (_) { /* ignore */ }
-    }
+    // Clear ALL shapes to avoid duplicates from async race conditions
+    try { chart.removeAllShapes(); } catch (_) { /* ignore */ }
     shapeIdsRef.current = [];
     const ids = shapeIdsRef.current;
 
