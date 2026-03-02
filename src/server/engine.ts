@@ -1102,11 +1102,12 @@ export function startEngine(
   // Fetch HTF candles at startup (after 1m candles are loaded)
   fetchHTFHistoricalCandles();
 
-  // ── Helper: build full candle payload ──
+  // ── Helper: build candle payload for initial sync (last 1500 per exchange) ──
   function buildFullCandlePayload(): Record<string, Candle[]> {
     const payload: Record<string, Candle[]> = {};
     for (const [key, candles] of candlesByExchange) {
-      payload[key] = Array.from(candles.values()).sort((a, b) => a.time - b.time);
+      const sorted = Array.from(candles.values()).sort((a, b) => a.time - b.time);
+      payload[key] = sorted.slice(-1500); // limit initial sync size
     }
     return payload;
   }
