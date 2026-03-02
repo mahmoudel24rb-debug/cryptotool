@@ -1096,7 +1096,7 @@ export function startEngine(
     const payload: Record<string, Candle[]> = {};
     for (const [key, candles] of candlesByExchange) {
       const sorted = Array.from(candles.values()).sort((a, b) => a.time - b.time);
-      payload[key] = sorted.slice(-1500); // limit initial sync size
+      payload[key] = sorted.slice(-3000); // ~2 days of 1m candles
     }
     return payload;
   }
@@ -1122,7 +1122,7 @@ export function startEngine(
     const candlePayload = buildFullCandlePayload();
     const htfPayload = buildHTFPayload();
     const cvdFull = getCvdSeries();
-    const cvdPayload = cvdFull.slice(-1500); // limit initial sync
+    const cvdPayload = cvdFull.slice(-3000);
 
     for (const ws of newClients) {
       sendToClient(ws, 'candles', candlePayload);
