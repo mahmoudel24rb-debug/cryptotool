@@ -82,8 +82,15 @@ app.get('/api/health', (_req, res) => {
 
 // Serve static frontend in production
 if (process.env.NODE_ENV === 'production') {
-  const clientDir = path.join(__dirname, '../client');
+  // Support both tsx (src/server/) and compiled (dist/server/) paths
+  const distClient = path.join(__dirname, '../client');
+  const clientDir = fs.existsSync(path.join(distClient, 'index.html'))
+    ? distClient
+    : path.resolve(__dirname, '../../dist/client');
   app.use(express.static(clientDir));
+  // Serve charting_library from public/
+  const publicDir = path.resolve(__dirname, '../../public');
+  if (fs.existsSync(publicDir)) app.use(express.static(publicDir));
   app.get('*', (_req, res) => {
     res.sendFile(path.join(clientDir, 'index.html'));
   });
