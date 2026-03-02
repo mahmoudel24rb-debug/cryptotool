@@ -168,7 +168,7 @@ export default function Chart({
   const shapeIdsRef = useRef<string[]>([]);
   const vwapRef = useRef(vwapData);
   const structureRef = useRef(structureData);
-  const overlayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const overlayTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const drawingRef = useRef(false); // mutex to prevent concurrent draws
 
   // Keep refs in sync
@@ -261,13 +261,14 @@ export default function Chart({
       // Add volume as overlay on main pane (forceOverlay = true)
       widget.activeChart().createStudy('Volume', true, false);
 
-      // Draw initial overlays after a short delay (let chart render first)
-      setTimeout(() => drawAllOverlays(), 1000);
+      // Draw initial overlays after a short delay, then refresh every 15s
+      setTimeout(() => drawAllOverlays(), 1500);
+      overlayTimerRef.current = setInterval(() => drawAllOverlays(), 15000);
     });
 
     return () => {
       readyRef.current = false;
-      if (overlayTimerRef.current) clearTimeout(overlayTimerRef.current);
+      if (overlayTimerRef.current) clearInterval(overlayTimerRef.current);
       if (widgetRef.current) {
         try { widgetRef.current.remove(); } catch (_) { /* ignore */ }
         widgetRef.current = null;
@@ -287,13 +288,6 @@ export default function Chart({
     datafeedRef.current.onRealtimeUpdate();
   }, [candlesByExchange, htfCandles]);
 
-  // ── Redraw structure overlays when data changes (throttled to 5s) ──
-  useEffect(() => {
-    if (!readyRef.current || !widgetRef.current) return;
-    if (overlayTimerRef.current) clearTimeout(overlayTimerRef.current);
-    overlayTimerRef.current = setTimeout(() => drawAllOverlays(), 5000);
-  }, [structureData, vwapData]);
-
   // ── Draw all overlays (async-safe with mutex) ──
   async function drawAllOverlays() {
     if (!widgetRef.current || !readyRef.current) return;
@@ -304,9 +298,15 @@ export default function Chart({
       const chart = widgetRef.current.activeChart();
       if (!chart) return;
 
-      // Clear ALL shapes first
-      try { chart.removeAllShapes(); } catch (_) { /* ignore */ }
+      // Remove previously tracked shapes by ID (reliable)
+      const oldIds = shapeIdsRef.current;
       shapeIdsRef.current = [];
+      for (const id of oldIds) {
+        try { chart.removeEntity(id); } catch (_) { /* ignore */ }
+      }
+      // Safety net: also try removeAllShapes
+      try { chart.removeAllShapes(); } catch (_) { /* ignore */ }
+
       const ids = shapeIdsRef.current;
 
       const vwap = vwapRef.current;
