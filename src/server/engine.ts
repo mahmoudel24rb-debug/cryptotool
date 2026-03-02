@@ -843,6 +843,7 @@ export function startEngine(
 
     const current = cvdPerMinute.get(minuteTs) || 0;
     cvdPerMinute.set(minuteTs, current + delta);
+    cvdCacheDirty = true;
 
     // Prune old entries
     if (cvdPerMinute.size > MAX_CANDLES + 10) {
@@ -853,7 +854,12 @@ export function startEngine(
     }
   }
 
+  // CVD cache — rebuild only when data changes, not on every read
+  let cvdCache: { time: number; value: number }[] = [];
+  let cvdCacheDirty = true;
+
   function getCvdSeries(): { time: number; value: number }[] {
+    if (!cvdCacheDirty) return cvdCache;
     const sorted = Array.from(cvdPerMinute.entries()).sort((a, b) => a[0] - b[0]);
     const series: { time: number; value: number }[] = [];
     let cumulative = 0;
@@ -861,6 +867,8 @@ export function startEngine(
       cumulative += delta;
       series.push({ time, value: cumulative });
     }
+    cvdCache = series;
+    cvdCacheDirty = false;
     return series;
   }
 
@@ -1132,7 +1140,8 @@ export function startEngine(
 
     const candlePayload = buildFullCandlePayload();
     const htfPayload = buildHTFPayload();
-    const cvdPayload = getCvdSeries();
+    const cvdFull = getCvdSeries();
+    const cvdPayload = cvdFull.slice(-1500); // limit initial sync
 
     for (const ws of newClients) {
       sendToClient(ws, 'candles', candlePayload);
@@ -1160,10 +1169,10 @@ export function startEngine(
     }
     broadcast('candle_tick', payload);
 
-    // CVD tip: just the last point
-    const cvdSeries = getCvdSeries();
-    if (cvdSeries.length > 0) {
-      broadcast('cvd_tick', cvdSeries[cvdSeries.length - 1]);
+    // CVD tip: just the last point (use cache, don't rebuild)
+    const cached = getCvdSeries();
+    if (cached.length > 0) {
+      broadcast('cvd_tick', cached[cached.length - 1]);
     }
   }, 500);
 
