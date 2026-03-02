@@ -247,6 +247,17 @@ export function startEngine(
   confluenceEngine.loadState();
   confluenceEngine.startStatePersistence();
 
+  // Journal cache — load once at startup, update in memory (no blocking reads on sync)
+  const journalCache: any[] = [];
+  try {
+    const journalPath = SCENARIO_CONFIG.SCENARIO_LOG_PATH;
+    if (existsSync(journalPath)) {
+      const lines = readFileSync(journalPath, 'utf-8').trim().split('\n').filter(Boolean);
+      for (const l of lines) { try { journalCache.push(JSON.parse(l)); } catch {} }
+      console.log(`[JOURNAL] Loaded ${journalCache.length} outcome(s) from disk`);
+    }
+  } catch {}
+
   // Graceful shutdown: save state before exit
   const gracefulShutdown = () => {
     console.log('[ENGINE] Saving scenario state before shutdown...');
@@ -260,9 +271,10 @@ export function startEngine(
     broadcast(event, scenario);
     // Save state immediately on any scenario change
     confluenceEngine.saveState();
-    // Broadcast completed scenario to journal in real-time
+    // Broadcast completed scenario to journal in real-time + update cache
     const isFinal = scenario.status === 'INVALIDATED' || scenario.status === 'EXPIRED' || scenario.status === 'TP3_HIT';
     if (isFinal) {
+      journalCache.push(scenario);
       broadcast('journal:entry', scenario);
     }
   });
@@ -1128,21 +1140,11 @@ export function startEngine(
     const htfPayload = buildHTFPayload();
     const cvdPayload = getCvdSeries();
 
-    // Load journal entries from JSONL
-    let journalEntries: any[] = [];
-    try {
-      const journalPath = SCENARIO_CONFIG.SCENARIO_LOG_PATH;
-      if (existsSync(journalPath)) {
-        const lines = readFileSync(journalPath, 'utf-8').trim().split('\n').filter(Boolean);
-        journalEntries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-      }
-    } catch {}
-
     for (const ws of newClients) {
       sendToClient(ws, 'candles', candlePayload);
       sendToClient(ws, 'cvd', cvdPayload);
       sendToClient(ws, 'candles_htf', htfPayload);
-      sendToClient(ws, 'journal', journalEntries);
+      sendToClient(ws, 'journal', journalCache);
     }
     console.log(`[WS] Sent full sync to ${newClients.length} new client(s)`);
   }, 2000);
