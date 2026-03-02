@@ -40,7 +40,6 @@ export default function App() {
   const [volumeProfileData, setVolumeProfileData] = useState<any>(null);
   const [derivativesData, setDerivativesData] = useState<any>(null);
   const [scenarios, setScenarios] = useState<any[]>([]);
-  const [journalTrades, setJournalTrades] = useState<any[]>([]);
   const [htfCandles, setHtfCandles] = useState<Record<string, Record<string, any[]>>>({});
 
   // Mutable stores for high-frequency data (avoid array copies on every tick)
@@ -306,22 +305,6 @@ export default function App() {
     return unsub;
   }, [subscribe]);
 
-  // Journal — full history on connect
-  useEffect(() => {
-    const unsub = subscribe('journal', (msg) => {
-      setJournalTrades(msg.data as any[]);
-    });
-    return unsub;
-  }, [subscribe]);
-
-  // Journal — new entry in real-time
-  useEffect(() => {
-    const unsub = subscribe('journal:entry', (msg) => {
-      setJournalTrades(prev => [...prev, msg.data]);
-    });
-    return unsub;
-  }, [subscribe]);
-
   // ── Build GlobalContext value ──
   const globalState: GlobalState = {
     connected,
@@ -338,7 +321,6 @@ export default function App() {
     volumeProfileData,
     derivativesData,
     scenarios,
-    journalTrades,
     unreadAlerts,
     lastSpike,
     htfCandles,
@@ -347,7 +329,7 @@ export default function App() {
   const globalActions: GlobalActions = {
     setAlerts, setMetrics, setCandlesByExchange, setOrderBooks,
     setCvdData, setVwapData, setStructureData, setVolumeProfileData,
-    setDerivativesData, setScenarios, setJournalTrades, setTrend, setTrendScore,
+    setDerivativesData, setScenarios, setTrend, setTrendScore,
     setCurrentPrice, setLastSpike, setHtfCandles,
     setConnected: () => {},
     clearUnread,

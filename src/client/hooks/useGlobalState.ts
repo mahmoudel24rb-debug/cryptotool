@@ -39,7 +39,6 @@ export interface GlobalState {
   volumeProfileData: any;
   derivativesData: any;
   scenarios: any[];
-  journalTrades: any[];
 
   // Unread alert counters per tab
   unreadAlerts: Record<TabId, number>;
@@ -62,7 +61,6 @@ export interface GlobalActions {
   setVolumeProfileData: React.Dispatch<React.SetStateAction<any>>;
   setDerivativesData: React.Dispatch<React.SetStateAction<any>>;
   setScenarios: React.Dispatch<React.SetStateAction<any[]>>;
-  setJournalTrades: React.Dispatch<React.SetStateAction<any[]>>;
   setTrend: React.Dispatch<React.SetStateAction<'BULL' | 'BEAR' | 'NEUTRAL'>>;
   setTrendScore: React.Dispatch<React.SetStateAction<number>>;
   setCurrentPrice: React.Dispatch<React.SetStateAction<number>>;

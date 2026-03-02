@@ -28,8 +28,6 @@ import { BasisTracker } from './derivatives/basis';
 import type { DerivativesState } from './derivatives/types';
 import { ConfluenceEngine } from './scenarios/confluenceEngine';
 import type { ConfluenceSignal } from './scenarios/types';
-import { SCENARIO_CONFIG } from './scenarios/confluenceEngine';
-import { readFileSync, existsSync } from 'fs';
 
 type BroadcastFn = (type: string, data: unknown) => void;
 type SendToClientFn = (ws: any, type: string, data: unknown) => void;
@@ -247,17 +245,6 @@ export function startEngine(
   confluenceEngine.loadState();
   confluenceEngine.startStatePersistence();
 
-  // Journal cache — load once at startup, update in memory (no blocking reads on sync)
-  const journalCache: any[] = [];
-  try {
-    const journalPath = SCENARIO_CONFIG.SCENARIO_LOG_PATH;
-    if (existsSync(journalPath)) {
-      const lines = readFileSync(journalPath, 'utf-8').trim().split('\n').filter(Boolean);
-      for (const l of lines) { try { journalCache.push(JSON.parse(l)); } catch {} }
-      console.log(`[JOURNAL] Loaded ${journalCache.length} outcome(s) from disk`);
-    }
-  } catch {}
-
   // Graceful shutdown: save state before exit
   const gracefulShutdown = () => {
     console.log('[ENGINE] Saving scenario state before shutdown...');
@@ -271,12 +258,6 @@ export function startEngine(
     broadcast(event, scenario);
     // Save state immediately on any scenario change
     confluenceEngine.saveState();
-    // Broadcast completed scenario to journal in real-time + update cache
-    const isFinal = scenario.status === 'INVALIDATED' || scenario.status === 'EXPIRED' || scenario.status === 'TP3_HIT';
-    if (isFinal) {
-      journalCache.push(scenario);
-      broadcast('journal:entry', scenario);
-    }
   });
 
   // Helper: feed a signal into the confluence engine
@@ -1147,7 +1128,6 @@ export function startEngine(
       sendToClient(ws, 'candles', candlePayload);
       sendToClient(ws, 'cvd', cvdPayload);
       sendToClient(ws, 'candles_htf', htfPayload);
-      sendToClient(ws, 'journal', journalCache);
     }
     console.log(`[WS] Sent full sync to ${newClients.length} new client(s)`);
   }, 2000);
