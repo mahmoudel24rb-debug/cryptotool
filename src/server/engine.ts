@@ -544,15 +544,8 @@ export function startEngine(
     connector.connect();
   }
 
-  // Batch broadcast: send aggregated data to frontend every 100ms
+  // Broadcast order books every 2 seconds (trades broadcast removed — unused by client)
   setInterval(() => {
-    // Broadcast recent trades (aggregated)
-    const recentTrades = tradeBuffer.getRecent(1000);
-    if (recentTrades.length > 0) {
-      broadcast('trades', recentTrades);
-    }
-
-    // Broadcast order books
     const books: Record<string, any> = {};
     for (const [key, book] of orderBooks) {
       books[key] = {
@@ -567,7 +560,7 @@ export function startEngine(
     if (Object.keys(books).length > 0) {
       broadcast('orderbooks', books);
     }
-  }, 100);
+  }, 2000);
 
   // Broadcast metrics every second
   setInterval(() => {
