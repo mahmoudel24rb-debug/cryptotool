@@ -28,6 +28,8 @@ import { BasisTracker } from './derivatives/basis';
 import type { DerivativesState } from './derivatives/types';
 import { ConfluenceEngine } from './scenarios/confluenceEngine';
 import type { ConfluenceSignal } from './scenarios/types';
+import { SCENARIO_CONFIG } from './scenarios/confluenceEngine';
+import { readFileSync, existsSync } from 'fs';
 
 type BroadcastFn = (type: string, data: unknown) => void;
 type SendToClientFn = (ws: any, type: string, data: unknown) => void;
@@ -258,6 +260,11 @@ export function startEngine(
     broadcast(event, scenario);
     // Save state immediately on any scenario change
     confluenceEngine.saveState();
+    // Broadcast completed scenario to journal in real-time
+    const isFinal = scenario.status === 'INVALIDATED' || scenario.status === 'EXPIRED' || scenario.status === 'TP3_HIT';
+    if (isFinal) {
+      broadcast('journal:entry', scenario);
+    }
   });
 
   // Helper: feed a signal into the confluence engine
@@ -1121,10 +1128,21 @@ export function startEngine(
     const htfPayload = buildHTFPayload();
     const cvdPayload = getCvdSeries();
 
+    // Load journal entries from JSONL
+    let journalEntries: any[] = [];
+    try {
+      const journalPath = SCENARIO_CONFIG.SCENARIO_LOG_PATH;
+      if (existsSync(journalPath)) {
+        const lines = readFileSync(journalPath, 'utf-8').trim().split('\n').filter(Boolean);
+        journalEntries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+      }
+    } catch {}
+
     for (const ws of newClients) {
       sendToClient(ws, 'candles', candlePayload);
       sendToClient(ws, 'cvd', cvdPayload);
       sendToClient(ws, 'candles_htf', htfPayload);
+      sendToClient(ws, 'journal', journalEntries);
     }
     console.log(`[WS] Sent full sync to ${newClients.length} new client(s)`);
   }, 2000);

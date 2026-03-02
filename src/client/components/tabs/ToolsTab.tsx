@@ -207,22 +207,12 @@ function Screener({ state }: { state: any }) {
   );
 }
 
-// ── Trade Journal ──
-interface TradeEntry {
-  id: string;
-  date: string;
-  direction: 'LONG' | 'SHORT';
-  entry: number;
-  exit: number | null;
-  size: string;
-  pnl: number | null;
-  rr: number | null;
-  notes: string;
-}
-
+// ── Trade Journal (auto-populated from scenario outcomes) ──
 function TradeJournal() {
-  const [trades, setTrades] = useState<TradeEntry[]>([]);
+  const { state } = useGlobalState();
+  const trades = state.journalTrades || [];
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const scrollRef = useRef(0);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -236,57 +226,151 @@ function TradeJournal() {
     canvas.height = rect.height * dpr;
     ctx.scale(dpr, dpr);
     const W = rect.width;
-    const H = rect.height;
 
     ctx.fillStyle = '#0a0e14';
-    ctx.fillRect(0, 0, W, H);
+    ctx.fillRect(0, 0, W, rect.height);
 
     const pad = 24;
     let y = 20;
 
+    // Title + stats summary
     ctx.fillStyle = '#ffd700';
     ctx.font = 'bold 14px monospace';
     ctx.textAlign = 'left';
     ctx.fillText('TRADE JOURNAL', pad, y + 12);
+
+    if (trades.length > 0) {
+      // Compute stats
+      const tp1Hits = trades.filter((t: any) => t.tp1Hit).length;
+      const tp2Hits = trades.filter((t: any) => t.tp2Hit).length;
+      const tp3Hits = trades.filter((t: any) => t.tp3Hit).length;
+      const slHits = trades.filter((t: any) => t.finalStatus === 'INVALIDATED' && t.exitReason?.includes('Stop-loss')).length;
+      const expired = trades.filter((t: any) => t.finalStatus === 'EXPIRED').length;
+      const activated = trades.filter((t: any) => t.tp1Hit || t.exitReason?.includes('Stop-loss')).length;
+      const winRate = activated > 0 ? ((tp1Hits / activated) * 100).toFixed(1) : '—';
+
+      ctx.fillStyle = '#6b7280';
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'right';
+      ctx.fillText(`${trades.length} scenarios | WR: ${winRate}% | TP1: ${tp1Hits} TP2: ${tp2Hits} TP3: ${tp3Hits} | SL: ${slHits} | EXP: ${expired}`, W - pad, y + 12);
+    }
+
     y += 32;
 
     if (trades.length === 0) {
       ctx.fillStyle = '#4b5563';
       ctx.font = '11px monospace';
       ctx.textAlign = 'center';
-      ctx.fillText('No trades logged yet.', W / 2, y + 40);
-      ctx.fillText('Click + NEW TRADE to start tracking your trades.', W / 2, y + 58);
+      ctx.fillText('En attente de scenarios termines...', W / 2, y + 40);
+      ctx.fillText('Les trades sont enregistres automatiquement.', W / 2, y + 58);
       return;
     }
 
-    // Headers
-    const cx = [pad, 100, 160, 260, 360, 430, 500];
-    const headers = ['DATE', 'DIR', 'ENTRY', 'EXIT', 'P&L', 'R:R', 'NOTES'];
-    ctx.fillStyle = '#6b7280'; ctx.font = 'bold 9px monospace'; ctx.textAlign = 'left';
-    for (let i = 0; i < headers.length; i++) ctx.fillText(headers[i], cx[i], y + 10);
-    y += 16;
-    ctx.strokeStyle = '#1e293b'; ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(W - pad, y); ctx.stroke();
-    y += 8;
+    // Column definitions
+    const cols = [
+      { label: 'DATE', x: pad, w: 85 },
+      { label: 'TEMPLATE', x: pad + 85, w: 160 },
+      { label: 'DIR', x: pad + 245, w: 55 },
+      { label: 'ENTRY', x: pad + 300, w: 75 },
+      { label: 'EXIT', x: pad + 375, w: 75 },
+      { label: 'STATUS', x: pad + 450, w: 90 },
+      { label: 'SCORE', x: pad + 540, w: 55 },
+      { label: 'R:R', x: pad + 595, w: 45 },
+      { label: 'DURATION', x: pad + 640, w: 70 },
+    ];
 
-    for (const t of trades) {
-      ctx.font = '10px monospace'; ctx.textAlign = 'left';
-      ctx.fillStyle = '#9ca3af'; ctx.fillText(t.date, cx[0], y + 12);
-      ctx.fillStyle = t.direction === 'LONG' ? '#22c55e' : '#ef4444'; ctx.font = 'bold 10px monospace'; ctx.fillText(t.direction, cx[1], y + 12);
-      ctx.fillStyle = '#e5e7eb'; ctx.font = '10px monospace';
-      ctx.fillText(`$${t.entry.toFixed(0)}`, cx[2], y + 12);
-      ctx.fillText(t.exit ? `$${t.exit.toFixed(0)}` : '—', cx[3], y + 12);
-      if (t.pnl !== null) { ctx.fillStyle = t.pnl >= 0 ? '#22c55e' : '#ef4444'; ctx.fillText(`${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(0)}`, cx[4], y + 12); }
-      if (t.rr !== null) { ctx.fillStyle = t.rr >= 0 ? '#22c55e' : '#ef4444'; ctx.fillText(`${t.rr.toFixed(1)}R`, cx[5], y + 12); }
-      ctx.fillStyle = '#6b7280'; ctx.fillText(t.notes.slice(0, 25), cx[6], y + 12);
-      y += 24;
+    // Headers
+    ctx.fillStyle = '#6b7280';
+    ctx.font = 'bold 9px monospace';
+    ctx.textAlign = 'left';
+    for (const col of cols) ctx.fillText(col.label, col.x, y + 10);
+    y += 16;
+    ctx.strokeStyle = '#1e293b';
+    ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(W - pad, y); ctx.stroke();
+    y += 6;
+
+    // Show trades newest first
+    const sorted = [...trades].reverse();
+    const maxVisible = Math.floor((rect.height - y - 20) / 26);
+
+    for (let i = 0; i < Math.min(sorted.length, maxVisible); i++) {
+      const t = sorted[i] as any;
+      const date = new Date(t.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
+      const entryPrice = t.entryMid ? `$${t.entryMid.toFixed(0)}` : '—';
+      const exitPrice = t.exitPrice ? `$${t.exitPrice.toFixed(0)}` : '—';
+      const durationMin = t.durationMs ? `${(t.durationMs / 60000).toFixed(1)}m` : '—';
+
+      // Status color
+      let statusColor = '#6b7280';
+      let statusText = t.finalStatus || '—';
+      if (t.tp3Hit) { statusColor = '#22c55e'; statusText = 'TP3 HIT'; }
+      else if (t.tp2Hit) { statusColor = '#22c55e'; statusText = 'TP2 HIT'; }
+      else if (t.tp1Hit) { statusColor = '#86efac'; statusText = 'TP1 + SL'; }
+      else if (t.finalStatus === 'INVALIDATED') {
+        if (t.exitReason?.includes('Stop-loss')) { statusColor = '#ef4444'; statusText = 'SL HIT'; }
+        else if (t.exitReason?.includes('Replaced')) { statusColor = '#f59e0b'; statusText = 'REPLACED'; }
+        else { statusColor = '#ef4444'; statusText = 'INVALID'; }
+      }
+      else if (t.finalStatus === 'EXPIRED') { statusColor = '#6b7280'; statusText = 'EXPIRED'; }
+
+      const dirColor = t.direction === 'LONG' ? '#22c55e' : '#ef4444';
+
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'left';
+
+      // Date
+      ctx.fillStyle = '#9ca3af';
+      ctx.fillText(date, cols[0].x, y + 12);
+
+      // Template (truncated)
+      ctx.fillStyle = '#e5e7eb';
+      const tmpl = (t.template || '').slice(0, 20);
+      ctx.fillText(tmpl, cols[1].x, y + 12);
+
+      // Direction
+      ctx.fillStyle = dirColor;
+      ctx.font = 'bold 10px monospace';
+      ctx.fillText(t.direction || '—', cols[2].x, y + 12);
+
+      // Entry
+      ctx.fillStyle = '#e5e7eb';
+      ctx.font = '10px monospace';
+      ctx.fillText(entryPrice, cols[3].x, y + 12);
+
+      // Exit
+      ctx.fillText(exitPrice, cols[4].x, y + 12);
+
+      // Status
+      ctx.fillStyle = statusColor;
+      ctx.font = 'bold 9px monospace';
+      ctx.fillText(statusText, cols[5].x, y + 12);
+
+      // Score
+      ctx.fillStyle = t.adjustedScore >= 55 ? '#ffd700' : t.adjustedScore >= 40 ? '#f59e0b' : '#6b7280';
+      ctx.font = '10px monospace';
+      ctx.fillText(`${t.adjustedScore || t.rawScore || '—'}`, cols[6].x, y + 12);
+
+      // R:R — not from the scenario R:R but we can show it
+      ctx.fillStyle = '#9ca3af';
+      ctx.fillText('—', cols[7].x, y + 12);
+
+      // Duration
+      ctx.fillStyle = '#9ca3af';
+      ctx.fillText(durationMin, cols[8].x, y + 12);
+
+      y += 26;
+
+      // Separator
+      ctx.strokeStyle = '#111827';
+      ctx.beginPath(); ctx.moveTo(pad, y - 4); ctx.lineTo(W - pad, y - 4); ctx.stroke();
     }
 
-    y += 16;
-    const wins = trades.filter(t => t.pnl !== null && t.pnl > 0).length;
-    const total = trades.filter(t => t.pnl !== null).length;
-    const wr = total > 0 ? ((wins / total) * 100).toFixed(1) : '—';
-    ctx.fillStyle = '#6b7280'; ctx.font = '9px monospace'; ctx.textAlign = 'left';
-    ctx.fillText(`STATS: ${trades.length} trades | Winrate: ${wr}%`, pad, y + 10);
+    if (sorted.length > maxVisible) {
+      ctx.fillStyle = '#4b5563';
+      ctx.font = '9px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(`+${sorted.length - maxVisible} more trades`, W / 2, y + 10);
+    }
   }, [trades]);
 
   useEffect(() => {
@@ -301,36 +385,6 @@ function TradeJournal() {
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', background: '#0a0e14' }}>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '8px 24px', borderBottom: '1px solid #1a1a2e', flexShrink: 0 }}>
-        <button
-          onClick={() => {
-            setTrades(prev => [...prev, {
-              id: Date.now().toString(),
-              date: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-              direction: Math.random() > 0.5 ? 'LONG' : 'SHORT',
-              entry: 85000 + Math.random() * 2000,
-              exit: 85000 + Math.random() * 3000,
-              size: '0.1 BTC',
-              pnl: (Math.random() - 0.4) * 200,
-              rr: (Math.random() - 0.3) * 4,
-              notes: 'Manual entry',
-            }]);
-          }}
-          style={{
-            padding: '6px 16px',
-            background: '#ffd70022',
-            border: '1px solid #ffd70044',
-            color: '#ffd700',
-            fontSize: 10,
-            fontWeight: 700,
-            cursor: 'pointer',
-            fontFamily: "'JetBrains Mono', monospace",
-            borderRadius: 2,
-          }}
-        >
-          + NEW TRADE
-        </button>
-      </div>
       <div style={{ flex: 1, minHeight: 0 }}>
         <canvas ref={canvasRef} style={{ width: '100%', height: '100%', display: 'block' }} />
       </div>

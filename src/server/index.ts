@@ -80,6 +80,19 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
 
+// Trade journal endpoint — returns all completed scenario outcomes
+app.get('/api/journal', (_req, res) => {
+  try {
+    const journalPath = path.resolve(process.cwd(), './data/scenario_outcomes.jsonl');
+    if (!fs.existsSync(journalPath)) return res.json([]);
+    const lines = fs.readFileSync(journalPath, 'utf-8').trim().split('\n').filter(Boolean);
+    const entries = lines.map(line => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
+    res.json(entries);
+  } catch (err) {
+    res.json([]);
+  }
+});
+
 // Serve static frontend in production
 if (process.env.NODE_ENV === 'production') {
   // Prefer dist/client/ (built assets), fallback to ../client (compiled tsc layout)
