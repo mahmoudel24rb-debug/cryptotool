@@ -544,8 +544,15 @@ export function startEngine(
     connector.connect();
   }
 
-  // Broadcast order books every 2 seconds (was 100ms — way too frequent)
+  // Batch broadcast: send aggregated data to frontend every 100ms
   setInterval(() => {
+    // Broadcast recent trades (aggregated)
+    const recentTrades = tradeBuffer.getRecent(1000);
+    if (recentTrades.length > 0) {
+      broadcast('trades', recentTrades);
+    }
+
+    // Broadcast order books
     const books: Record<string, any> = {};
     for (const [key, book] of orderBooks) {
       books[key] = {
@@ -560,7 +567,7 @@ export function startEngine(
     if (Object.keys(books).length > 0) {
       broadcast('orderbooks', books);
     }
-  }, 2000);
+  }, 100);
 
   // Broadcast metrics every second
   setInterval(() => {
@@ -824,7 +831,6 @@ export function startEngine(
 
     const current = cvdPerMinute.get(minuteTs) || 0;
     cvdPerMinute.set(minuteTs, current + delta);
-    cvdCacheDirty = true;
 
     // Prune old entries
     if (cvdPerMinute.size > MAX_CANDLES + 10) {
@@ -835,12 +841,7 @@ export function startEngine(
     }
   }
 
-  // CVD cache — rebuild only when data changes, not on every read
-  let cvdCache: { time: number; value: number }[] = [];
-  let cvdCacheDirty = true;
-
   function getCvdSeries(): { time: number; value: number }[] {
-    if (!cvdCacheDirty) return cvdCache;
     const sorted = Array.from(cvdPerMinute.entries()).sort((a, b) => a[0] - b[0]);
     const series: { time: number; value: number }[] = [];
     let cumulative = 0;
@@ -848,8 +849,6 @@ export function startEngine(
       cumulative += delta;
       series.push({ time, value: cumulative });
     }
-    cvdCache = series;
-    cvdCacheDirty = false;
     return series;
   }
 
@@ -1091,12 +1090,11 @@ export function startEngine(
   // Fetch HTF candles at startup (after 1m candles are loaded)
   fetchHTFHistoricalCandles();
 
-  // ── Helper: build candle payload for initial sync (last 1500 per exchange) ──
+  // ── Helper: build full candle payload ──
   function buildFullCandlePayload(): Record<string, Candle[]> {
     const payload: Record<string, Candle[]> = {};
     for (const [key, candles] of candlesByExchange) {
-      const sorted = Array.from(candles.values()).sort((a, b) => a.time - b.time);
-      payload[key] = sorted.slice(-3000); // ~2 days of 1m candles
+      payload[key] = Array.from(candles.values()).sort((a, b) => a.time - b.time);
     }
     return payload;
   }
@@ -1121,8 +1119,7 @@ export function startEngine(
 
     const candlePayload = buildFullCandlePayload();
     const htfPayload = buildHTFPayload();
-    const cvdFull = getCvdSeries();
-    const cvdPayload = cvdFull.slice(-3000);
+    const cvdPayload = getCvdSeries();
 
     for (const ws of newClients) {
       sendToClient(ws, 'candles', candlePayload);
@@ -1149,10 +1146,10 @@ export function startEngine(
     }
     broadcast('candle_tick', payload);
 
-    // CVD tip: just the last point (use cache, don't rebuild)
-    const cached = getCvdSeries();
-    if (cached.length > 0) {
-      broadcast('cvd_tick', cached[cached.length - 1]);
+    // CVD tip: just the last point
+    const cvdSeries = getCvdSeries();
+    if (cvdSeries.length > 0) {
+      broadcast('cvd_tick', cvdSeries[cvdSeries.length - 1]);
     }
   }, 500);
 

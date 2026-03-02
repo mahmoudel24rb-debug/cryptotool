@@ -88,20 +88,11 @@ if (process.env.NODE_ENV === 'production') {
   const clientDir = fs.existsSync(path.join(fromDist, 'assets'))
     ? fromDist
     : fromCompiled;
-  // Static assets (JS/CSS with content hashes) — cache aggressively
-  app.use('/assets', express.static(path.join(clientDir, 'assets'), {
-    maxAge: '30d',
-    immutable: true,
-  }));
-  app.use(express.static(clientDir, { maxAge: 0 }));
+  app.use(express.static(clientDir));
   // Serve charting_library from public/
   const publicDir = path.resolve(__dirname, '../../public');
   if (fs.existsSync(publicDir)) app.use(express.static(publicDir));
-  // index.html — never cache (so new builds are picked up immediately)
   app.get('*', (_req, res) => {
-    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
     res.sendFile(path.join(clientDir, 'index.html'));
   });
 }
