@@ -8,6 +8,77 @@ import {
   SignalContribution,
 } from './types';
 import { matchTemplate, ScenarioTemplate } from './scenarioTemplates';
+import { appendFileSync, mkdirSync, existsSync } from 'fs';
+import { dirname } from 'path';
+
+// ═══════════════════════════════════════════════════════════════
+// Configurable constants — all tunables in one place
+// ═══════════════════════════════════════════════════════════════
+
+export const SCENARIO_CONFIG = {
+  // Phase 1.1 — Trend integration
+  TREND_ALIGNED_MAX_BOOST: 0.25,     // +25% max si parfaitement aligné
+  TREND_COUNTER_MAX_PENALTY: 0.40,   // -40% max si fortement contre-tendance
+
+  // Phase 1.2 — Strength weighting
+  MIN_STRENGTH_FLOOR: 0.3,           // signal ne peut valoir < 30% de son poids
+
+  // Phase 1.5 — Contra penalty (progressive)
+  CONTRA_PENALTY_HIGH: 0.70,         // signaux poids >= 15
+  CONTRA_PENALTY_MEDIUM: 0.50,       // signaux poids >= 8
+  CONTRA_PENALTY_LOW: 0.30,          // signaux poids < 8
+
+  // Phase 2.3 — Trailing SL
+  TRAILING_SL_ENABLED: true,
+
+  // Phase 3.1 — Scoring avancé
+  DECAY_RATE: 0.7,
+  TF_MULTIPLIERS: { '1m': 0.8, '5m': 1.0, '15m': 1.3, '1h': 1.5 } as Record<string, number>,
+  PROXIMITY_MAX_DISTANCE: 0.01,      // 1% max distance for proximity factor
+
+  // Phase 3.2 — Clustering temporel
+  CLUSTER_WINDOW_MS: 30_000,         // 30 secondes
+  CLUSTER_BONUS_HIGH: 10,            // 3+ paires dans la fenêtre
+  CLUSTER_BONUS_LOW: 5,              // 1-2 paires
+
+  // Phase 3.3 — Signal anchor minimum
+  MINIMUM_ANCHOR_WEIGHT: 10,         // au moins 1 signal poids >= 10
+
+  // Phase 1.4 — TTL par type de signal (ms)
+  SIGNAL_TTL_MS: {
+    ORDER_BLOCK:      15 * 60 * 1000,
+    FVG:              15 * 60 * 1000,
+    LIQUIDITY_SWEEP:  10 * 60 * 1000,
+    STRUCTURE:        10 * 60 * 1000,
+    BOS:              10 * 60 * 1000,
+    CHoCH:            10 * 60 * 1000,
+    OB_RETEST:        15 * 60 * 1000,
+    FVG_FILL:         15 * 60 * 1000,
+    SWEEP:            10 * 60 * 1000,
+    FUNDING_EXTREME:   8 * 60 * 1000,
+    FUNDING:           8 * 60 * 1000,
+    OI_SURGE:          8 * 60 * 1000,
+    OI_FLUSH:          8 * 60 * 1000,
+    OI_DIVERGENCE:     8 * 60 * 1000,
+    BASIS_EXTREME:     5 * 60 * 1000,
+    BASIS:             5 * 60 * 1000,
+    ABSORPTION:        5 * 60 * 1000,
+    DIVERGENCE:        5 * 60 * 1000,
+    SPIKE:             2 * 60 * 1000,
+    VELOCITY:          2 * 60 * 1000,
+    EXHAUSTION:        3 * 60 * 1000,
+    TWAP:              5 * 60 * 1000,
+    LIQUIDATION:       3 * 60 * 1000,
+    VWAP_POSITION:     5 * 60 * 1000,
+    VWAP:              5 * 60 * 1000,
+    VOLUME_PROFILE:    5 * 60 * 1000,
+    POC:               5 * 60 * 1000,
+  } as Record<string, number>,
+  DEFAULT_SIGNAL_TTL_MS: 5 * 60 * 1000,
+
+  // Phase 4 — Logging
+  SCENARIO_LOG_PATH: './data/scenario_outcomes.jsonl',
+};
 
 const DEFAULT_CONFIG: ConfluenceConfig = {
   weights: {
@@ -31,11 +102,11 @@ const DEFAULT_CONFIG: ConfluenceConfig = {
   minScoreForScenario: 30,
   highPriorityThreshold: 55,
   extremePriorityThreshold: 75,
-  signalTimeWindowMs: 300000,
+  signalTimeWindowMs: 300000,       // fallback, overridden by per-signal TTL
   scenarioExpirationMs: 1800000,
   maxActiveScenarios: 5,
   minRiskReward: 1.5,
-  slBufferPercent: 0.1,
+  slBufferPercent: 0.2,             // Phase 2.1: 0.1 → 0.2%
 };
 
 // Map signal types to weight keys
@@ -70,6 +141,61 @@ const SIGNAL_WEIGHT_MAP: Record<string, keyof ConfluenceConfig['weights']> = {
   'POC': 'volumeProfile',
 };
 
+// ═══════════════════════════════════════════════════════════════
+// Helper: progressive contra penalty (Phase 1.5)
+// ═══════════════════════════════════════════════════════════════
+
+function getContraPenaltyRatio(signalWeight: number): number {
+  if (signalWeight >= 15) return SCENARIO_CONFIG.CONTRA_PENALTY_HIGH;
+  if (signalWeight >= 8)  return SCENARIO_CONFIG.CONTRA_PENALTY_MEDIUM;
+  return SCENARIO_CONFIG.CONTRA_PENALTY_LOW;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Helper: temporal cluster bonus (Phase 3.2)
+// ═══════════════════════════════════════════════════════════════
+
+function computeTemporalClusterBonus(signals: ConfluenceSignal[]): number {
+  if (signals.length < 2) return 0;
+  const sorted = [...signals].sort((a, b) => a.timestamp - b.timestamp);
+  let clusterPairs = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    for (let j = i + 1; j < sorted.length; j++) {
+      if (sorted[j].timestamp - sorted[i].timestamp <= SCENARIO_CONFIG.CLUSTER_WINDOW_MS) {
+        clusterPairs++;
+      }
+    }
+  }
+  if (clusterPairs >= 3) return SCENARIO_CONFIG.CLUSTER_BONUS_HIGH;
+  if (clusterPairs >= 1) return SCENARIO_CONFIG.CLUSTER_BONUS_LOW;
+  return 0;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Helper: anchor signal check (Phase 3.3)
+// ═══════════════════════════════════════════════════════════════
+
+function hasAnchorSignal(
+  signals: ConfluenceSignal[],
+  direction: ScenarioDirection,
+  weights: ConfluenceConfig['weights'],
+): boolean {
+  return signals.some(s => {
+    if (s.direction !== direction) return false;
+    const weightKey = SIGNAL_WEIGHT_MAP[s.type];
+    const weight = weightKey ? weights[weightKey] : 5;
+    return weight >= SCENARIO_CONFIG.MINIMUM_ANCHOR_WEIGHT;
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Trend provider interface (injected from engine.ts)
+// ═══════════════════════════════════════════════════════════════
+
+export interface TrendProvider {
+  analyze(): { trend: string; score: number };
+}
+
 /**
  * Confluence Engine — event-driven scoring system.
  * Collects signals, groups them by price zone, matches templates,
@@ -81,6 +207,7 @@ export class ConfluenceEngine {
   private activeScenarios: TradeScenario[] = [];
   private scenarioCallback: ((event: string, scenario: TradeScenario) => void) | null = null;
   private currentPrice = 0;
+  private trendProvider: TrendProvider | null = null;
 
   constructor(config: Partial<ConfluenceConfig> = {}) {
     this.config = {
@@ -88,6 +215,11 @@ export class ConfluenceEngine {
       ...config,
       weights: { ...DEFAULT_CONFIG.weights, ...(config.weights || {}) },
     };
+  }
+
+  /** Inject the TrendAnalyzer for trend-aligned scoring (Phase 1.1) */
+  setTrendProvider(provider: TrendProvider): void {
+    this.trendProvider = provider;
   }
 
   onScenario(cb: (event: string, scenario: TradeScenario) => void): void {
@@ -121,14 +253,27 @@ export class ConfluenceEngine {
 
   getActiveScenarios(): TradeScenario[] {
     return this.activeScenarios.filter(s =>
-      s.status === 'PENDING' || s.status === 'ACTIVE' || s.status === 'TRIGGERED'
+      s.status === 'PENDING' || s.status === 'ACTIVE' ||
+      s.status === 'TRIGGERED' || s.status === 'TP1_HIT' ||
+      s.status === 'TP2_HIT'
     );
   }
 
+  // ═══════════════════════════════════════════════════════════
+  // Phase 1.4: TTL differentiated by signal type
+  // ═══════════════════════════════════════════════════════════
+
   private pruneOldSignals(): void {
-    const cutoff = Date.now() - this.config.signalTimeWindowMs;
-    this.signals = this.signals.filter(s => s.timestamp >= cutoff);
+    const now = Date.now();
+    this.signals = this.signals.filter(s => {
+      const ttl = SCENARIO_CONFIG.SIGNAL_TTL_MS[s.type] ?? SCENARIO_CONFIG.DEFAULT_SIGNAL_TTL_MS;
+      return (now - s.timestamp) <= ttl;
+    });
   }
+
+  // ═══════════════════════════════════════════════════════════
+  // Main evaluation pipeline
+  // ═══════════════════════════════════════════════════════════
 
   private evaluate(): void {
     if (this.currentPrice <= 0) return;
@@ -141,9 +286,22 @@ export class ConfluenceEngine {
       const direction = this.determineDirection(zone);
       if (!direction) continue;
 
-      // Calculate score
-      const { score, maxScore, contributions } = this.calculateScore(zone, direction);
-      if (score < this.config.minScoreForScenario) continue;
+      // Phase 3.3: Require at least one anchor signal (weight >= 10)
+      if (!hasAnchorSignal(zone, direction, this.config.weights)) continue;
+
+      // Calculate score (Phase 1.2 strength + Phase 1.5 contra + Phase 3.1 decay/proximity)
+      const { score: rawScore, maxScore, contributions } = this.calculateScore(zone, direction);
+
+      // Phase 3.2: Temporal cluster bonus
+      const clusterBonus = computeTemporalClusterBonus(zone);
+      const scoreWithCluster = rawScore + clusterBonus;
+
+      // Phase 1.1: Apply trend multiplier
+      const { adjustedScore, trendScore, trendMultiplier } = this.applyTrendMultiplier(
+        scoreWithCluster, direction,
+      );
+
+      if (adjustedScore < this.config.minScoreForScenario) continue;
 
       // Try to match a template
       const template = matchTemplate(zone, direction, contributions);
@@ -153,8 +311,20 @@ export class ConfluenceEngine {
       if (this.isDuplicate(template, direction)) continue;
 
       // Build the scenario
-      const scenario = this.buildScenario(template, direction, score, maxScore, contributions, zone);
+      const scenario = this.buildScenario(
+        template, direction, adjustedScore, maxScore, contributions, zone,
+      );
       if (!scenario) continue;
+
+      // Attach scoring meta
+      scenario.meta = {
+        rawScore,
+        trendScore,
+        trendMultiplier,
+        adjustedScore,
+        hasAnchorSignal: true,
+        clusterBonus,
+      };
 
       // Check R:R
       if (scenario.riskReward < this.config.minRiskReward) continue;
@@ -164,14 +334,16 @@ export class ConfluenceEngine {
       if (active.length >= this.config.maxActiveScenarios) {
         // Replace lowest score if new is higher
         const lowest = active.reduce((min, s) => s.score < min.score ? s : min, active[0]);
-        if (score <= lowest.score) continue;
+        if (adjustedScore <= lowest.score) continue;
         lowest.status = 'INVALIDATED';
         lowest.invalidationReason = 'Replaced by higher-score scenario';
         this.emit('scenario:invalidated', lowest);
+        this.logOutcome(lowest);
         this.activeScenarios = this.activeScenarios.filter(s => s.id !== lowest.id);
       }
 
       this.activeScenarios.push(scenario);
+      console.log(`[SCENARIO] NEW ${scenario.direction} "${scenario.templateName}" | raw=${rawScore} trend=${trendScore} mult=${trendMultiplier.toFixed(2)} adj=${adjustedScore} cluster=${clusterBonus} | R:R=${scenario.riskReward} | signals: ${contributions.map(c => c.name).join(', ')}`);
       this.emit('scenario:new', scenario);
     }
   }
@@ -190,7 +362,6 @@ export class ConfluenceEngine {
       const diff = Math.abs(sig.price - zoneCenter) / zoneCenter;
       if (diff < 0.003) { // within 0.3%
         currentZone.push(sig);
-        // Update center as average
         zoneCenter = currentZone.reduce((s, c) => s + c.price, 0) / currentZone.length;
       } else {
         if (currentZone.length >= 2) zones.push(currentZone);
@@ -200,12 +371,11 @@ export class ConfluenceEngine {
     }
     if (currentZone.length >= 2) zones.push(currentZone);
 
-    // Also try evaluating ALL signals as one zone if they're within 1% of current price
+    // Also try evaluating ALL signals within 1% of current price
     const nearPrice = this.signals.filter(s =>
       Math.abs(s.price - this.currentPrice) / this.currentPrice < 0.01
     );
     if (nearPrice.length >= 2) {
-      // Avoid adding if it's the same as an existing zone
       const isNew = !zones.some(z =>
         z.length === nearPrice.length && z.every((s, i) => s === nearPrice[i])
       );
@@ -230,41 +400,112 @@ export class ConfluenceEngine {
     return null;
   }
 
+  // ═══════════════════════════════════════════════════════════
+  // Phase 1.2 + 1.5 + 3.1: Scoring with strength, decay,
+  // proximity, TF multiplier, and progressive contra penalty
+  // ═══════════════════════════════════════════════════════════
+
   private calculateScore(
     signals: ConfluenceSignal[],
     direction: ScenarioDirection,
   ): { score: number; maxScore: number; contributions: SignalContribution[] } {
     const contributions: SignalContribution[] = [];
-    const usedWeightKeys = new Set<string>();
+    // Track best signal per weight key (for deduplication: keep highest strength)
+    const bestByWeightKey = new Map<string, { signal: ConfluenceSignal; effectiveScore: number; weight: number }>();
     let score = 0;
     let maxScore = 0;
+    const now = Date.now();
 
     for (const sig of signals) {
       const weightKey = SIGNAL_WEIGHT_MAP[sig.type] || 'spike';
       const weight = this.config.weights[weightKey] || 5;
       maxScore += weight;
 
-      // Only count signals aligned with direction (contra signals reduce score)
       if (sig.direction === direction) {
-        // Avoid double-counting same signal type
-        if (!usedWeightKeys.has(weightKey)) {
-          score += weight;
-          usedWeightKeys.add(weightKey);
-          contributions.push({
-            name: sig.type,
-            weight,
-            direction: sig.direction,
-            timestamp: sig.timestamp,
-            details: sig.details?.description || sig.details?.interpretation || undefined,
-          });
+        // Phase 3.1: Compute continuous score for this signal
+        const effectiveScore = this.computeSignalScore(sig, weight, now);
+
+        // Deduplication: keep the best signal per weight key
+        const existing = bestByWeightKey.get(weightKey);
+        if (!existing || effectiveScore > existing.effectiveScore) {
+          bestByWeightKey.set(weightKey, { signal: sig, effectiveScore, weight });
         }
       } else {
-        // Contra signal — reduce score slightly
-        score -= Math.floor(weight * 0.3);
+        // Contra signal — Phase 1.5: progressive penalty
+        const strength = Math.max(SCENARIO_CONFIG.MIN_STRENGTH_FLOOR, sig.strength ?? 1.0);
+        const penaltyRatio = getContraPenaltyRatio(weight);
+        score -= Math.floor(weight * strength * penaltyRatio);
       }
     }
 
+    // Sum up best signal per category
+    for (const [, entry] of bestByWeightKey) {
+      score += entry.effectiveScore;
+      contributions.push({
+        name: entry.signal.type,
+        weight: entry.effectiveScore,
+        direction: entry.signal.direction,
+        timestamp: entry.signal.timestamp,
+        details: entry.signal.details?.description || entry.signal.details?.interpretation || undefined,
+      });
+    }
+
     return { score: Math.max(0, score), maxScore, contributions };
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // Phase 3.1: Continuous signal score (strength * decay * proximity * TF)
+  // ═══════════════════════════════════════════════════════════
+
+  private computeSignalScore(signal: ConfluenceSignal, baseWeight: number, now: number): number {
+    // 1. Strength (Phase 1.2)
+    const strength = Math.max(SCENARIO_CONFIG.MIN_STRENGTH_FLOOR, signal.strength ?? 1.0);
+
+    // 2. Temporal decay: signal loses value as it ages
+    const ttl = SCENARIO_CONFIG.SIGNAL_TTL_MS[signal.type] ?? SCENARIO_CONFIG.DEFAULT_SIGNAL_TTL_MS;
+    const age = now - signal.timestamp;
+    const decay = Math.max(0, 1.0 - (age / ttl) * SCENARIO_CONFIG.DECAY_RATE);
+
+    // 3. Proximity to current price
+    const distance = this.currentPrice > 0
+      ? Math.abs(signal.price - this.currentPrice) / this.currentPrice
+      : 0;
+    const proximity = Math.max(0, 1.0 - (distance / SCENARIO_CONFIG.PROXIMITY_MAX_DISTANCE));
+
+    // 4. Timeframe multiplier
+    const tfMultiplier = SCENARIO_CONFIG.TF_MULTIPLIERS[signal.timeframe || '1m'] ?? 1.0;
+
+    return Math.round(baseWeight * strength * decay * proximity * tfMultiplier);
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // Phase 1.1: Trend multiplier
+  // ═══════════════════════════════════════════════════════════
+
+  private applyTrendMultiplier(
+    score: number,
+    direction: ScenarioDirection,
+  ): { adjustedScore: number; trendScore: number; trendMultiplier: number } {
+    if (!this.trendProvider) {
+      return { adjustedScore: score, trendScore: 0, trendMultiplier: 1.0 };
+    }
+
+    const { score: trendScore } = this.trendProvider.analyze();
+
+    const isAligned = (direction === 'LONG' && trendScore > 0)
+                   || (direction === 'SHORT' && trendScore < 0);
+    const isCounter = (direction === 'LONG' && trendScore < 0)
+                   || (direction === 'SHORT' && trendScore > 0);
+
+    let trendMultiplier = 1.0;
+    if (isAligned) {
+      trendMultiplier = 1.0 + (Math.abs(trendScore) / 100) * SCENARIO_CONFIG.TREND_ALIGNED_MAX_BOOST;
+    } else if (isCounter) {
+      trendMultiplier = 1.0 - (Math.abs(trendScore) / 100) * SCENARIO_CONFIG.TREND_COUNTER_MAX_PENALTY;
+    }
+
+    const adjustedScore = Math.round(score * trendMultiplier);
+    return { adjustedScore, trendScore, trendMultiplier };
   }
 
   private isDuplicate(template: ScenarioTemplate, direction: ScenarioDirection): boolean {
@@ -272,9 +513,13 @@ export class ConfluenceEngine {
       s.templateId === template.id &&
       s.direction === direction &&
       (s.status === 'PENDING' || s.status === 'ACTIVE') &&
-      Date.now() - s.createdAt < 120000 // within 2 min
+      Date.now() - s.createdAt < 120000
     );
   }
+
+  // ═══════════════════════════════════════════════════════════
+  // Phase 2.1: Wider entry zone / SL
+  // ═══════════════════════════════════════════════════════════
 
   private buildScenario(
     template: ScenarioTemplate,
@@ -287,7 +532,9 @@ export class ConfluenceEngine {
     const price = this.currentPrice;
     if (price <= 0) return null;
 
-    const buffer = price * (this.config.slBufferPercent / 100);
+    const slBuffer = price * (this.config.slBufferPercent / 100);
+    // Phase 2.1: Entry zone buffer is wider than SL buffer
+    const entryBuffer = price * 0.003; // 0.3%
 
     // Find zone bounds from signals
     const zonePrices = signals.map(s => s.price);
@@ -299,23 +546,23 @@ export class ConfluenceEngine {
     let invalidationPrice: number;
 
     if (direction === 'LONG') {
-      entryLow = Math.min(zoneLow, price * 0.999);
-      entryHigh = Math.max(zoneHigh, price * 1.001);
-      stopLoss = entryLow - buffer;
+      entryLow = Math.min(zoneLow, price) - entryBuffer;
+      entryHigh = Math.max(zoneHigh, price) + entryBuffer;
+      stopLoss = entryLow - slBuffer;
       const risk = entryHigh - stopLoss;
       tp1 = entryHigh + risk * 1.5;
       tp2 = entryHigh + risk * 2.5;
       tp3 = entryHigh + risk * 4;
-      invalidationPrice = stopLoss - buffer;
+      invalidationPrice = stopLoss - slBuffer;
     } else {
-      entryLow = Math.min(zoneLow, price * 0.999);
-      entryHigh = Math.max(zoneHigh, price * 1.001);
-      stopLoss = entryHigh + buffer;
+      entryLow = Math.min(zoneLow, price) - entryBuffer;
+      entryHigh = Math.max(zoneHigh, price) + entryBuffer;
+      stopLoss = entryHigh + slBuffer;
       const risk = stopLoss - entryLow;
       tp1 = entryLow - risk * 1.5;
       tp2 = entryLow - risk * 2.5;
       tp3 = entryLow - risk * 4;
-      invalidationPrice = stopLoss + buffer;
+      invalidationPrice = stopLoss + slBuffer;
     }
 
     // Calculate R:R to TP2
@@ -361,37 +608,53 @@ export class ConfluenceEngine {
     };
   }
 
+  // ═══════════════════════════════════════════════════════════
+  // Phase 2.3: TP2/TP3 tracking + trailing SL + excursion tracking
+  // ═══════════════════════════════════════════════════════════
+
   private updateScenarioLifecycle(): void {
     const now = Date.now();
     const price = this.currentPrice;
 
     for (const sc of this.activeScenarios) {
-      if (sc.status === 'INVALIDATED' || sc.status === 'EXPIRED') continue;
+      if (sc.status === 'INVALIDATED' || sc.status === 'EXPIRED' || sc.status === 'TP3_HIT') continue;
 
-      // Check expiration
-      if (now >= sc.expiresAt) {
+      // Expiration only for PENDING and ACTIVE (TP-hit scenarios keep tracking)
+      if ((sc.status === 'PENDING' || sc.status === 'ACTIVE') && now >= sc.expiresAt) {
         sc.status = 'EXPIRED';
+        sc.exitTime = now;
+        sc.exitReason = 'Expired';
         this.emit('scenario:expired', sc);
+        this.logOutcome(sc);
         continue;
       }
 
-      // Check invalidation
-      if (sc.direction === 'LONG' && price < sc.invalidationPrice) {
-        sc.status = 'INVALIDATED';
-        sc.invalidationReason = `Price below invalidation $${sc.invalidationPrice.toFixed(0)}`;
-        this.emit('scenario:invalidated', sc);
-        continue;
-      }
-      if (sc.direction === 'SHORT' && price > sc.invalidationPrice) {
-        sc.status = 'INVALIDATED';
-        sc.invalidationReason = `Price above invalidation $${sc.invalidationPrice.toFixed(0)}`;
-        this.emit('scenario:invalidated', sc);
-        continue;
-      }
-
-      // Lifecycle transitions
+      // Check invalidation (price beyond invalidation level)
       if (sc.status === 'PENDING') {
-        // Check if price entered entry zone
+        if (sc.direction === 'LONG' && price < sc.invalidationPrice) {
+          sc.status = 'INVALIDATED';
+          sc.invalidationReason = `Price below invalidation $${sc.invalidationPrice.toFixed(0)}`;
+          sc.exitPrice = price;
+          sc.exitTime = now;
+          sc.exitReason = sc.invalidationReason;
+          this.emit('scenario:invalidated', sc);
+          this.logOutcome(sc);
+          continue;
+        }
+        if (sc.direction === 'SHORT' && price > sc.invalidationPrice) {
+          sc.status = 'INVALIDATED';
+          sc.invalidationReason = `Price above invalidation $${sc.invalidationPrice.toFixed(0)}`;
+          sc.exitPrice = price;
+          sc.exitTime = now;
+          sc.exitReason = sc.invalidationReason;
+          this.emit('scenario:invalidated', sc);
+          this.logOutcome(sc);
+          continue;
+        }
+      }
+
+      // PENDING → ACTIVE: price enters entry zone
+      if (sc.status === 'PENDING') {
         if (price >= sc.entryLow && price <= sc.entryHigh) {
           sc.status = 'ACTIVE';
           sc.updatedAt = now;
@@ -399,31 +662,75 @@ export class ConfluenceEngine {
         }
       }
 
-      if (sc.status === 'ACTIVE') {
-        // Check if SL hit
-        if (sc.direction === 'LONG' && price <= sc.stopLoss) {
+      // ACTIVE / TP1_HIT / TP2_HIT: check SL then TP progression
+      if (sc.status === 'ACTIVE' || sc.status === 'TRIGGERED' ||
+          sc.status === 'TP1_HIT' || sc.status === 'TP2_HIT') {
+        // Update excursion tracking (Phase 4.2)
+        this.updateExcursions(sc, price);
+
+        // Check SL hit
+        const slHit = (sc.direction === 'LONG' && price <= sc.stopLoss)
+                    || (sc.direction === 'SHORT' && price >= sc.stopLoss);
+        if (slHit) {
+          const prevStatus = sc.status;
           sc.status = 'INVALIDATED';
-          sc.invalidationReason = 'Stop-loss hit';
+          sc.invalidationReason = `Stop-loss hit after ${prevStatus}`;
+          sc.exitPrice = price;
+          sc.exitTime = now;
+          sc.exitReason = sc.invalidationReason;
           this.emit('scenario:invalidated', sc);
-          continue;
-        }
-        if (sc.direction === 'SHORT' && price >= sc.stopLoss) {
-          sc.status = 'INVALIDATED';
-          sc.invalidationReason = 'Stop-loss hit';
-          this.emit('scenario:invalidated', sc);
+          this.logOutcome(sc);
           continue;
         }
 
-        // Check if any TP hit
-        if (sc.direction === 'LONG' && price >= sc.tp1) {
-          sc.status = 'TRIGGERED';
-          sc.updatedAt = now;
-          this.emit('scenario:update', sc);
+        const isLong = sc.direction === 'LONG';
+
+        // TP1
+        if (sc.status === 'ACTIVE') {
+          const tp1Hit = (isLong && price >= sc.tp1) || (!isLong && price <= sc.tp1);
+          if (tp1Hit) {
+            sc.status = 'TP1_HIT';
+            sc.tp1HitTime = now;
+            sc.tp1HitPrice = price;
+            sc.updatedAt = now;
+            // Trailing SL: move SL to breakeven
+            if (SCENARIO_CONFIG.TRAILING_SL_ENABLED) {
+              sc.stopLoss = (sc.entryLow + sc.entryHigh) / 2; // breakeven
+            }
+            this.emit('scenario:update', sc);
+          }
         }
-        if (sc.direction === 'SHORT' && price <= sc.tp1) {
-          sc.status = 'TRIGGERED';
-          sc.updatedAt = now;
-          this.emit('scenario:update', sc);
+
+        // TP2
+        if (sc.status === 'TP1_HIT' || sc.status === 'TRIGGERED') {
+          const tp2Hit = (isLong && price >= sc.tp2) || (!isLong && price <= sc.tp2);
+          if (tp2Hit) {
+            sc.status = 'TP2_HIT';
+            sc.tp2HitTime = now;
+            sc.tp2HitPrice = price;
+            sc.updatedAt = now;
+            // Trailing SL: move SL to TP1
+            if (SCENARIO_CONFIG.TRAILING_SL_ENABLED) {
+              sc.stopLoss = sc.tp1;
+            }
+            this.emit('scenario:update', sc);
+          }
+        }
+
+        // TP3
+        if (sc.status === 'TP2_HIT') {
+          const tp3Hit = (isLong && price >= sc.tp3) || (!isLong && price <= sc.tp3);
+          if (tp3Hit) {
+            sc.status = 'TP3_HIT';
+            sc.tp3HitTime = now;
+            sc.tp3HitPrice = price;
+            sc.exitPrice = price;
+            sc.exitTime = now;
+            sc.exitReason = 'TP3 hit — full target reached';
+            sc.updatedAt = now;
+            this.emit('scenario:update', sc);
+            this.logOutcome(sc);
+          }
         }
       }
 
@@ -431,13 +738,90 @@ export class ConfluenceEngine {
       sc.currentPrice = price;
     }
 
-    // Clean up old invalidated/expired (keep for 60s for UI display)
+    // Clean up old invalidated/expired/TP3 (keep for 60s for UI display)
     this.activeScenarios = this.activeScenarios.filter(s => {
-      if (s.status === 'INVALIDATED' || s.status === 'EXPIRED') {
+      if (s.status === 'INVALIDATED' || s.status === 'EXPIRED' || s.status === 'TP3_HIT') {
         return now - s.updatedAt < 60000;
       }
       return true;
     });
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // Phase 4.2: Excursion tracking
+  // ═══════════════════════════════════════════════════════════
+
+  private updateExcursions(scenario: TradeScenario, currentPrice: number): void {
+    if (scenario.direction === 'LONG') {
+      scenario.maxFavorableExcursion = Math.max(
+        scenario.maxFavorableExcursion ?? currentPrice,
+        currentPrice,
+      );
+      scenario.maxAdverseExcursion = Math.min(
+        scenario.maxAdverseExcursion ?? currentPrice,
+        currentPrice,
+      );
+    } else {
+      scenario.maxFavorableExcursion = Math.min(
+        scenario.maxFavorableExcursion ?? currentPrice,
+        currentPrice,
+      );
+      scenario.maxAdverseExcursion = Math.max(
+        scenario.maxAdverseExcursion ?? currentPrice,
+        currentPrice,
+      );
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // Phase 4.1: Scenario outcome logging
+  // ═══════════════════════════════════════════════════════════
+
+  private logOutcome(scenario: TradeScenario): void {
+    try {
+      const logPath = SCENARIO_CONFIG.SCENARIO_LOG_PATH;
+      const dir = dirname(logPath);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+      const outcome = {
+        id: scenario.id,
+        template: scenario.templateName,
+        templateId: scenario.templateId,
+        direction: scenario.direction,
+        createdAt: scenario.createdAt,
+        rawScore: scenario.meta?.rawScore ?? scenario.score,
+        trendScore: scenario.meta?.trendScore ?? 0,
+        trendMultiplier: scenario.meta?.trendMultiplier ?? 1.0,
+        adjustedScore: scenario.meta?.adjustedScore ?? scenario.score,
+        priority: scenario.priority,
+        signalCount: scenario.signals.length,
+        signalTypes: scenario.signals.map(s => s.name),
+        hasAnchorSignal: scenario.meta?.hasAnchorSignal ?? false,
+        clusterBonus: scenario.meta?.clusterBonus ?? 0,
+        entryMid: (scenario.entryLow + scenario.entryHigh) / 2,
+        sl: scenario.stopLoss,
+        tp1: scenario.tp1,
+        tp2: scenario.tp2,
+        tp3: scenario.tp3,
+        finalStatus: scenario.status,
+        exitPrice: scenario.exitPrice ?? null,
+        exitTime: scenario.exitTime ?? null,
+        exitReason: scenario.exitReason ?? scenario.invalidationReason ?? '',
+        durationMs: (scenario.exitTime ?? Date.now()) - scenario.createdAt,
+        maxFavorableExcursion: scenario.maxFavorableExcursion ?? null,
+        maxAdverseExcursion: scenario.maxAdverseExcursion ?? null,
+        tp1Hit: scenario.tp1HitTime != null,
+        tp2Hit: scenario.tp2HitTime != null,
+        tp3Hit: scenario.tp3HitTime != null,
+        hourOfDay: new Date(scenario.createdAt).getUTCHours(),
+        dayOfWeek: new Date(scenario.createdAt).getUTCDay(),
+        timeframe: scenario.timeframe,
+      };
+
+      appendFileSync(logPath, JSON.stringify(outcome) + '\n');
+    } catch (err) {
+      console.warn('[SCENARIO_LOG] Failed to write outcome:', (err as Error).message);
+    }
   }
 
   private emit(event: string, scenario: TradeScenario): void {

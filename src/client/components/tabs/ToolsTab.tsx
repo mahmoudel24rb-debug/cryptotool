@@ -136,7 +136,7 @@ function Screener({ state }: { state: any }) {
     const volume = state.metrics?.volumePerMinute > 0 ? `$${(state.metrics.volumePerMinute / 1e6).toFixed(1)}M/m` : '—';
     const trend = state.structureData?.['5m']?.trend || '—';
     const trendColor = trend === 'UPTREND' ? '#22c55e' : trend === 'DOWNTREND' ? '#ef4444' : '#6b7280';
-    const activeScenarios = (state.scenarios || []).filter((s: any) => s.status === 'PENDING' || s.status === 'ACTIVE');
+    const activeScenarios = (state.scenarios || []).filter((s: any) => s.status === 'PENDING' || s.status === 'ACTIVE' || s.status === 'TP1_HIT' || s.status === 'TP2_HIT');
 
     let oiChangeStr = '—';
     let oiColor = '#6b7280';

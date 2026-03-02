@@ -34,6 +34,17 @@ export class OpenInterestTracker {
     this.latestPrice.set(exchange, price);
   }
 
+  /** Get best available price (fallback across exchanges) */
+  private getPrice(exchange: string): number {
+    const direct = this.latestPrice.get(exchange);
+    if (direct && direct > 0) return direct;
+    // Fallback: use any available price (all are BTC, close enough)
+    for (const [, p] of this.latestPrice) {
+      if (p > 0) return p;
+    }
+    return 0;
+  }
+
   /** Start polling all exchanges */
   start(): void {
     this.poll(); // immediate first poll
@@ -63,13 +74,15 @@ export class OpenInterestTracker {
       if (!res.ok) return;
       const data = await res.json();
       // data: { openInterest: "12345.67", symbol: "BTCUSDT", time: 1234567890 }
-      const price = this.latestPrice.get('BINANCE_FUTURES') || this.latestPrice.get('BINANCE') || 0;
+      const price = this.getPrice('BINANCE_FUTURES');
       const oiCoins = parseFloat(data.openInterest);
       const oiUsd = oiCoins * price;
       if (oiUsd > 0) {
         this.recordSnapshot('BINANCE_FUTURES', oiUsd, price);
       }
-    } catch { /* silent */ }
+    } catch (err) {
+      console.warn('[OI] Binance fetch failed:', (err as Error).message);
+    }
   }
 
   private async fetchBybit(): Promise<void> {
@@ -79,31 +92,40 @@ export class OpenInterestTracker {
       const data = await res.json();
       const list = data?.result?.list;
       if (Array.isArray(list) && list.length > 0) {
-        const oiUsd = parseFloat(list[0].openInterest);
-        const price = this.latestPrice.get('BYBIT') || 0;
+        // Bybit returns OI in coins (BTC), must multiply by price
+        const oiCoins = parseFloat(list[0].openInterest);
+        const price = this.getPrice('BYBIT');
+        const oiUsd = oiCoins * price;
         if (oiUsd > 0) {
-          this.recordSnapshot('BYBIT', oiUsd, price || oiUsd / (parseFloat(list[0].openInterest) || 1));
+          this.recordSnapshot('BYBIT', oiUsd, price);
         }
       }
-    } catch { /* silent */ }
+    } catch (err) {
+      console.warn('[OI] Bybit fetch failed:', (err as Error).message);
+    }
   }
 
   private async fetchOkx(): Promise<void> {
     try {
-      const res = await fetch('https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-volume?ccy=BTC');
+      // Real-time OI endpoint (not the historical stats one)
+      const res = await fetch('https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=BTC-USDT-SWAP');
       if (!res.ok) return;
       const data = await res.json();
       const list = data?.data;
       if (Array.isArray(list) && list.length > 0) {
-        // [timestamp, oi, vol]
-        const latest = list[list.length - 1];
-        const oiUsd = parseFloat(latest[1]);
-        const price = this.latestPrice.get('OKX') || 0;
+        // { instId, oi (contracts!), oiCcy (coins in BTC), ts }
+        // Must use oiCcy (BTC amount), NOT oi (contract count)
+        const entry = list[0];
+        const oiCoins = parseFloat(entry.oiCcy || '0');
+        const price = this.getPrice('OKX');
+        const oiUsd = oiCoins * price;
         if (oiUsd > 0) {
           this.recordSnapshot('OKX', oiUsd, price);
         }
       }
-    } catch { /* silent */ }
+    } catch (err) {
+      console.warn('[OI] OKX fetch failed:', (err as Error).message);
+    }
   }
 
   private async fetchHyperliquid(): Promise<void> {
@@ -127,7 +149,9 @@ export class OpenInterestTracker {
           }
         }
       }
-    } catch { /* silent */ }
+    } catch (err) {
+      console.warn('[OI] Hyperliquid fetch failed:', (err as Error).message);
+    }
   }
 
   private recordSnapshot(exchange: string, oi: number, price: number): void {

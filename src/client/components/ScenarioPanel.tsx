@@ -16,7 +16,7 @@ interface TradeScenario {
   score: number;
   maxScore: number;
   priority: 'LOW' | 'MEDIUM' | 'HIGH' | 'EXTREME';
-  status: 'PENDING' | 'ACTIVE' | 'TRIGGERED' | 'INVALIDATED' | 'EXPIRED';
+  status: 'PENDING' | 'ACTIVE' | 'TRIGGERED' | 'TP1_HIT' | 'TP2_HIT' | 'TP3_HIT' | 'INVALIDATED' | 'EXPIRED';
   entryLow: number;
   entryHigh: number;
   stopLoss: number;
@@ -49,6 +49,9 @@ const STATUS_COLORS: Record<string, string> = {
   PENDING: '#6b7280',
   ACTIVE: '#3b82f6',
   TRIGGERED: '#22c55e',
+  TP1_HIT: '#22c55e',
+  TP2_HIT: '#10b981',
+  TP3_HIT: '#059669',
   INVALIDATED: '#ef4444',
   EXPIRED: '#4b5563',
 };

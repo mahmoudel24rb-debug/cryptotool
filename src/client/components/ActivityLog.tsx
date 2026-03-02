@@ -81,15 +81,18 @@ export default function ActivityLog({ alerts }: ActivityLogProps) {
     });
   };
 
-  const filteredAlerts = alerts.filter(a => {
-    if (filters.size === 0) return true;
-    // Check if any active filter matches
-    for (const f of filters) {
-      const signalType = SIGNAL_MAP[f];
-      if (signalType && a.type === signalType) return true;
-    }
-    return false;
-  });
+  const filteredAlerts = React.useMemo(() => {
+    const filtered = alerts.filter(a => {
+      if (filters.size === 0) return true;
+      for (const f of filters) {
+        const signalType = SIGNAL_MAP[f];
+        if (signalType && a.type === signalType) return true;
+      }
+      return false;
+    });
+    // Only render the most recent 50 for performance (500 DOM nodes = lag)
+    return filtered.slice(0, 50);
+  }, [alerts, filters]);
 
   return (
     <div className="flex flex-col h-full panel">

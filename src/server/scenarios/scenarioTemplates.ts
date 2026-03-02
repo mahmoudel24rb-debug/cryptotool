@@ -132,6 +132,19 @@ export function matchTemplate(
     if (template.id === 5 && direction !== 'LONG') continue;   // Short squeeze = LONG
     if (template.id === 6 && direction !== 'SHORT') continue;  // Long squeeze = SHORT
 
+    // Phase 1.3: Verify funding sign for squeeze templates
+    if (template.id === 5 || template.id === 6) {
+      const fundingSignal = signals.find(s =>
+        s.type === 'FUNDING_EXTREME' || s.type === 'FUNDING'
+      );
+      if (fundingSignal) {
+        // Short Squeeze (5, LONG): funding must be negative → shorts pay longs → direction LONG
+        // Long Squeeze (6, SHORT): funding must be positive → longs pay shorts → direction SHORT
+        if (template.id === 5 && fundingSignal.direction !== 'LONG') continue;
+        if (template.id === 6 && fundingSignal.direction !== 'SHORT') continue;
+      }
+    }
+
     // Count required signal matches
     const requiredMatched = template.requiredSignals.filter(req =>
       signalTypes.has(req) || signalTypes.has(normalizeType(req))

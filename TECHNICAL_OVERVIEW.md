@@ -2,9 +2,9 @@
 
 **Real-Time Bitcoin Order Flow Intelligence Platform**
 
-A full-stack trading intelligence system that connects to 5 cryptocurrency exchanges simultaneously over WebSocket, processes raw trade/orderbook data through 7 signal detectors + multi-timeframe market structure analysis + derivatives tracking, and renders everything through a custom Canvas-based charting UI with scored trade scenarios.
+A full-stack trading intelligence system that connects to 5 cryptocurrency exchanges simultaneously over WebSocket, processes raw trade/orderbook data through 7 signal detectors + multi-timeframe market structure analysis + derivatives tracking, and renders everything through a TradingView Charting Library integration with scored trade scenarios.
 
-**Stack**: TypeScript, Node.js backend, React frontend, WebSocket real-time transport, Canvas 2D for all rendering.
+**Stack**: TypeScript, Node.js backend, React frontend, WebSocket real-time transport, TradingView Charting Library (custom datafeed).
 
 ---
 
@@ -29,7 +29,7 @@ A full-stack trading intelligence system that connects to 5 cryptocurrency excha
 ```
                         +-----------------------+
                         |   React Frontend      |
-                        |  (5 tabs, all Canvas) |
+                        | (5 tabs, TradingView) |
                         +-----------+-----------+
                                     |
                               WebSocket /ws
@@ -51,12 +51,17 @@ A full-stack trading intelligence system that connects to 5 cryptocurrency excha
 - **Phase C**: Open interest tracking, funding rate monitoring, basis/premium tracking
 - **Phase D**: Confluence engine aggregates all signals → scored trade scenarios
 
-Every trade from every exchange passes through a unified pipeline:
+Trades are processed in **batches** (100ms intervals) to prevent CPU saturation during big moves:
 ```
-Trade → updateCandle() → updateCvd() → candleBuilder.onTrade() → vwapCalculator.onTrade()
-      → volumeProfile.onTrade() → oiTracker.updatePrice() → basisTracker.updatePrice()
-      → confluenceEngine.updatePrice() → detectors.process() → metrics.onTrade()
+Trades buffered (100ms) → Batch processing:
+  Cheap ops (every trade): updateCandle() → updateCvd() → candleBuilder.onTrade()
+                          → vwapCalculator.onTrade() → volumeProfile.onTrade()
+  Expensive ops (once/batch): oiTracker.updatePrice() → basisTracker.updatePrice()
+                              → confluenceEngine.updatePrice() → detectors.process()
+                              → metrics.onTrade()
 ```
+
+Candle close events are also **deferred** (500ms queue with per-timeframe deduplication) to avoid blocking the main loop during structure/FVG/OB analysis.
 
 ---
 
@@ -77,17 +82,19 @@ Trade → updateCandle() → updateCvd() → candleBuilder.onTrade() → vwapCal
 **Historical Candles (fetched once at startup):**
 | Exchange | Endpoint | Limit |
 |---|---|---|
-| Binance Futures | `GET /fapi/v1/klines?symbol=BTCUSDT&interval=1m` | 1500 candles |
-| Binance Spot | `GET /api/v3/klines?symbol=BTCUSDT&interval=1m` | 1500 candles |
+| Binance Futures | `GET /fapi/v1/klines?symbol=BTCUSDT&interval=1m` | **4500 candles** (3 paginated requests of 1500, ~3 days) |
+| Binance Spot | `GET /api/v3/klines?symbol=BTCUSDT&interval=1m` | **4500 candles** (3 paginated requests of 1500) |
 | Bybit | `GET /v5/market/kline?category=linear&symbol=BTCUSDT&interval=1` | 1000 candles |
 | OKX | `GET /api/v5/market/candles?instId=BTC-USDT-SWAP&bar=1m` | 300 candles |
+
+MAX_CANDLES = 4500. Client-side pruning at 5000 (splices to 4500) to prevent memory growth.
 
 **Derivatives Polling (continuous):**
 | Data | Exchange | Endpoint | Interval |
 |---|---|---|---|
 | Open Interest | Binance Futures | `GET /fapi/v1/openInterest?symbol=BTCUSDT` | 10s |
 | Open Interest | Bybit | `GET /v5/market/open-interest?category=linear&symbol=BTCUSDT` | 10s |
-| Open Interest | OKX | `GET /api/v5/rubik/stat/contracts/open-interest-volume?ccy=BTC` | 10s |
+| Open Interest | OKX | `GET /api/v5/public/open-interest?instType=SWAP&instId=BTC-USDT-SWAP` | 10s |
 | Open Interest | Hyperliquid | `POST /info` (`metaAndAssetCtxs`) | 10s |
 | Funding Rate | Binance Futures | `GET /fapi/v1/fundingRate?symbol=BTCUSDT&limit=1` | 30s |
 | Funding Rate | Bybit | `GET /v5/market/tickers?category=linear&symbol=BTCUSDT` | 30s |
@@ -284,7 +291,7 @@ Stores up to 50 swings per direction.
 
 ### 5.1 Open Interest Tracker
 
-**Data source**: REST API polling from 4 exchanges every 10 seconds.
+**Data source**: REST API polling from 4 exchanges every 10 seconds. All APIs return OI in **coins (BTC)** or contracts — the tracker converts to USD by multiplying by the latest price (with cross-exchange fallback if a price isn't available yet).
 
 **Alert types**:
 - **OI_SURGE**: `|OI change| >= threshold%` in the direction of new positions opening
@@ -411,11 +418,11 @@ Weighted vote — each signal contributes its weight toward LONG or SHORT. Major
 
 When a zone scores above `minScore (30)`:
 - **Entry zone**: Union of all signal prices in the zone
-- **Stop loss**: `entryLow - buffer` (LONG) or `entryHigh + buffer` (SHORT), buffer = `price × 0.15%`
+- **Stop loss**: `entryLow - buffer` (LONG) or `entryHigh + buffer` (SHORT), buffer = `price × 0.1%`
 - **Take profit**: TP1 = 1.5R, TP2 = 2.5R, TP3 = 4R from entry midpoint
 - **Min R:R**: Must achieve at least 1.5:1 to TP2, otherwise discarded
 
-**Priority levels**: LOW (<30), MEDIUM (30-55), HIGH (55-75), EXTREME (>75)
+**Priority levels**: LOW (>=30), MEDIUM (>=40), HIGH (>=55), EXTREME (>=75)
 
 ### Scenario Lifecycle
 
@@ -452,121 +459,91 @@ Produces a composite sentiment score from -100 (extreme bearish) to +100 (extrem
 
 ## 9. Charting System
 
-### Architecture: Fully Custom Canvas 2D
+### Architecture: TradingView Charting Library + Custom Datafeed
 
-**No charting libraries used.** Everything is rendered directly on HTML5 Canvas via `CanvasRenderingContext2D`. This includes:
-- Candlestick OHLC chart (wicks + bodies)
-- Volume bars at bottom
-- Multi-exchange overlay lines (each exchange's close price as a colored line)
-- VWAP + σ bands (horizontal lines)
-- Market structure overlays (swing highs/lows, BOS/CHoCH labels, OB zones, FVG zones, liquidity pool lines)
-- Crosshair with price/time tooltips
-- Y-axis (price labels, auto-scale) and X-axis (time labels)
-- OHLC info bar (top-left, follows mouse)
-- Current price dashed line + tag
-- Horizontal scrolling via mouse drag or scroll wheel
-- Auto-scroll mode (follows latest candle)
-- "Go to latest" button when scrolled back
-- Timeframe selector (1m, 5m, 15m, 1h, 4h)
+The main chart uses the **TradingView Charting Library** (static assets served from `public/charting_library/`) with a custom datafeed class that bridges our WebSocket candle data to TradingView's `IBasicDataFeed` interface.
 
-### Rendering Loop
+**Key files:**
+- `src/client/components/Chart.tsx` — TradingView widget wrapper + structure overlay shapes
+- `src/client/datafeed/mackuantDatafeed.ts` — Custom datafeed (getBars, subscribeBars, etc.)
 
-The chart uses a persistent `requestAnimationFrame` loop (mounted once, never remounted):
+### Custom Datafeed (`MackuantDatafeed`)
 
-```typescript
-useEffect(() => {
-  // Setup canvas, ctx
-  const draw = () => {
-    // Read from refs (not React state) — decoupled from render cycle
-    const cbe = dataRef.current;        // candle data
-    const vwap = vwapRef.current;       // VWAP overlay
-    const struct = structureRef.current; // structure data
-    const tf = timeframeRef.current;    // active timeframe
+The datafeed holds a reference to a shared candle data store (updated from React) and implements:
 
-    // Full chart rendering: ~60fps
-    // 1. Clear canvas
-    // 2. Compute visible window from scroll offset
-    // 3. Auto-scale Y-axis from visible price range
-    // 4. Draw grid, volume bars, overlay lines, candlesticks
-    // 5. Draw VWAP bands, structure overlays (OBs, FVGs, liquidity)
-    // 6. Draw axes, labels, crosshair, OHLC bar
-  };
+- **`onReady(cb)`** — Config: supported resolutions `['1', '5', '15', '60', '240']`, crypto type
+- **`resolveSymbol(name, onResolve)`** — Returns `LibrarySymbolInfo` per exchange key (e.g. `BINANCE_FUTURES:PERP`). Session `24x7`, timezone `Etc/UTC`, pricescale `100`
+- **`getBars(symbolInfo, resolution, periodParams, onResult)`** — Reads from the candle store, aggregates 1m candles into target timeframe. For 1h/4h, merges HTF historical data. Uses **binary search** for range filtering (not `.filter()`)
+- **`subscribeBars(symbolInfo, resolution, onTick, guid)`** — Stores callback. `onRealtimeUpdate()` called externally to push live ticks
+- **`searchSymbols()`** — Returns known exchange symbols
 
-  const tick = () => { draw(); rafRef.current = requestAnimationFrame(tick); };
-  rafRef.current = requestAnimationFrame(tick);
-
-  // Mouse handlers for crosshair, drag-scroll, wheel-scroll
-  return () => cancelAnimationFrame(rafRef.current);
-}, []); // mounted once
-```
-
-**Key design decision**: All data is read from React refs, NOT from state. The rAF loop is completely decoupled from React's render cycle. React state changes only update the refs, and the rAF loop picks them up on the next frame.
+**Performance optimizations:**
+- **Bar cache**: Keyed by `symbol:resolution`, invalidated only when source data changes (length or lastTime)
+- **Binary search** in `getBars()` for O(log n) range filtering on sorted arrays
+- **Cache reset** on initial data load (big jump in bar count triggers `onResetCacheNeededCallback`)
 
 ### Multi-Timeframe Aggregation
 
-The backend stores 1m candles. For **5m and 15m**, candles are aggregated on the frontend from 1m data. For **1h and 4h**, the backend fetches 500 historical candles each from Binance Futures REST API at startup (`GET /fapi/v1/klines`), then continues building them in real-time from the trade stream via `updateHTFCandle()`. The frontend merges backend HTF history with recent 1m aggregation (recent overwrites historical via Map dedup).
-
-Frontend aggregation function:
-
-```typescript
-function aggregateCandles(candles: Candle[], tfSeconds: number): Candle[] {
-  const buckets = new Map<number, Candle>();
-  for (const c of candles) {
-    const bucketTime = Math.floor(c.time / tfSeconds) * tfSeconds;
-    const existing = buckets.get(bucketTime);
-    if (!existing) {
-      buckets.set(bucketTime, { time: bucketTime, open: c.open, high: c.high,
-                                 low: c.low, close: c.close, volume: c.volume });
-    } else {
-      existing.high = Math.max(existing.high, c.high);
-      existing.low = Math.min(existing.low, c.low);
-      existing.close = c.close;
-      existing.volume += c.volume;
-    }
-  }
-  return Array.from(buckets.values()).sort((a, b) => a.time - b.time);
-}
-```
+The backend stores 1m candles (up to 4500 per exchange). For **5m and 15m**, candles are aggregated in the datafeed from 1m data. For **1h and 4h**, the backend fetches 500 historical candles each from Binance Futures REST API at startup, then continues building them in real-time. The datafeed merges HTF history with recent 1m aggregation (Map dedup, recent overwrites historical).
 
 ### Data Flow to Chart
 
 ```
 Backend (engine.ts)                    Frontend (App.tsx)                   Chart.tsx
-┌─────────────────┐                   ┌────────────────────────┐        ┌───────────────┐
-│ candlesByExchange│─── WS 'candles'──>│ candleStoreRef (mutable)│──ref─>│ dataRef.current│
-│ (Map per exchange│    (every 30s)    │ + setCandlesByExch     │        │ (read by rAF)  │
-│  1500 × 1m each)│                   │   (throttled 2/sec)    │        │                │
-│                  │─── WS 'candle_tick│ mutate ref in-place    │        │ draw() at 60fps│
-│                  │    (every 500ms)  │ (zero array copies)    │        │                │
-│ htfCandles       │─── WS 'candles_htf│ setHtfCandles          │──ref─>│ htfRef.current │
-│ (500×1h + 500×4h)│   (every 30s)    │ (React state)          │        │ (merge + cache)│
-└─────────────────┘                   └────────────────────────┘        └───────────────┘
+┌─────────────────┐                   ┌────────────────────────┐        ┌──────────────────┐
+│ candlesByExchange│── WS initial sync─>│ candleStoreRef (mutable)│──ref─>│ MackuantDatafeed │
+│ (4500 × 1m each)│   (on connect only)│ + setCandlesByExch     │        │  .updateStore()  │
+│                  │── WS 'candle_tick' │ mutate ref in-place    │        │  .onRealtimeUpdate│
+│                  │   (every 500ms)   │ (zero array copies)    │        │      ↓            │
+│ htfCandles       │── WS 'candles_htf'│ setHtfCandles          │        │ TradingView Widget│
+│ (500×1h + 500×4h)│  (every 30s)     │ (React state)          │        │ (getBars/onTick)  │
+└─────────────────┘                   └────────────────────────┘        └──────────────────┘
 ```
 
-### Multi-Exchange Overlay
+### Structure Overlays
 
-The primary exchange (Binance Futures by default, or first available) is drawn as candlesticks. All other exchanges are drawn as colored close-price lines overlaid on the same chart:
+TradingView's `createShape()` and `createMultipointShape()` API is used to draw structure overlays on the chart:
 
-| Exchange | Color |
-|---|---|
-| Binance Futures | #3b82f6 (blue) — candlesticks |
-| Hyperliquid | #22c55e (green) — line |
-| Bybit | #a855f7 (purple) — line |
-| Binance Spot | #eab308 (yellow) — line |
-| Coinbase | #06b6d4 (cyan) — line |
-| OKX Spot | #f97316 (orange) — line |
-| OKX Perp | #ef4444 (red) — line |
+- **Order Blocks**: Rectangles (max 5 displayed) with strength-based opacity
+- **FVGs**: Rectangles (max 4) with fill tracking
+- **BOS/CHoCH labels**: Text shapes (max 5)
+- **Liquidity pools**: Horizontal lines (strength >= 4, max 3)
+- **Swing points**: Triangle shapes (4 highs + 4 lows)
+- **VWAP bands**: Horizontal lines labeled "VWAP +1", "VWAP -1", "VWAP +2", "VWAP -2"
 
-### Styling
+Overlays are updated when `structureData` or `vwapData` props change, with old shapes removed before redrawing.
 
-TradingView-inspired dark theme:
-- Background: `#131722`
-- Grid: `rgba(42, 46, 57, 0.5)`
-- Text: `#787b86`
-- Bullish candles: `#26a69a` (teal green)
-- Bearish candles: `#ef5350` (red)
-- Crosshair: `rgba(152, 157, 169, 0.25)`
-- Font: JetBrains Mono, monospace
+### CVD Chart (Custom Canvas)
+
+The CVD (Cumulative Volume Delta) chart remains a **custom Canvas 2D** component (`CvdChart.tsx`) since TradingView doesn't natively support CVD:
+
+- **Zoom**: Mouse wheel zooms in/out (0.3x to 8x multiplier on candle spacing)
+- **Time labels**: Smart spacing (min 80px), aligned to round intervals (5min, 15min, 1h...), date shown when span > 1 day
+- **Fullscreen mode**: Overlay triggered by button, exit with ESC key
+
+### TradingView Widget Configuration
+
+```typescript
+{
+  symbol: primaryExchangeKey,  // e.g. 'BINANCE_FUTURES:PERP'
+  interval: '1',
+  theme: 'dark',
+  library_path: '/charting_library/',
+  custom_css_url: '/charting_library/custom.css',
+  autosize: true,
+  disabled_features: [
+    'header_symbol_search', 'header_compare',
+    'display_market_status', 'timeframes_toolbar',
+    'use_localstorage_for_settings',
+  ],
+  enabled_features: ['hide_left_toolbar_by_default'],
+  overrides: {
+    'paneProperties.background': '#0a0a0a',
+    'paneProperties.backgroundType': 'solid',
+    // ... dark theme matching the UI
+  },
+}
+```
 
 ---
 
@@ -587,11 +564,13 @@ All communication between backend and frontend is over a single WebSocket connec
 | 3s | `volumeProfile` | POC, VAH, VAL, bins, HVN, LVN | Volume profile panel |
 | 5s | `scenarios` | Active trade scenarios | Scenario panel |
 | 10s | `derivatives` | OI, funding, basis aggregate | Derivatives tab |
-| 30s | `candles` | Full candle history per exchange | Chart history sync |
-| 30s | `cvd` | Full CVD series | CVD chart |
 | 30s | `candles_htf` | 1h (500) + 4h (500) candles per exchange | HTF chart history |
-| Event | `alert` | Detector alerts | Alert feed |
+| On connect | `candles` | Full candle history per exchange (4500 × ~4 exchanges) | Initial chart sync |
+| On connect | `cvd` | Full CVD series | Initial CVD sync |
+| Event | `alert` | Detector alerts (**batched**, flushed every 200ms) | Alert feed |
 | Event | `scenario:new/update/invalidated` | Real-time scenario events | Scenario updates |
+
+**Key change**: Full candle and CVD data is only sent **once on client WebSocket connect** (initial sync), not periodically. After that, only `candle_tick` and `cvd_tick` incremental updates are sent. This reduced memory pressure from ~5MB/cycle to near zero for steady-state operation.
 
 ### Message Format
 
@@ -608,7 +587,7 @@ All communication between backend and frontend is over a single WebSocket connec
 
 ### Historical Initialization Sequence (at startup)
 
-1. Fetch 1500 1m candles from 4 exchange REST APIs
+1. Fetch 4500 1m candles from Binance (paginated 3×1500), 1000 from Bybit, 300 from OKX
 2. Fetch 500 1h + 500 4h candles from Binance Futures REST API (HTF history)
 3. Seed `CandleBuilder` with Binance Futures 1m data → emits historical candle:close events
 4. Run `processHistorical()` on structure analyzers for each timeframe (1m, 5m, 15m)
@@ -644,30 +623,37 @@ All communication between backend and frontend is over a single WebSocket connec
 
 WebSocket subscriptions are set up in `App.tsx` and remain active even when switching tabs — no data gaps when changing views.
 
-### Canvas-Based Panels
+### Rendering Approach
 
-**Every data-heavy panel is rendered with Canvas 2D**, not DOM elements:
-- Chart (candlesticks, overlays, crosshair)
-- Trade tape (scrolling trade list)
-- Orderbook heatmap (bid/ask depth visualization)
-- OI, Funding, Basis panels (gauges, sparklines, bars)
-- Volume profile histogram
-- Scenario cards (with scroll support)
-- Screener tiles
+- **Main chart**: TradingView Charting Library (iframe-based, handles its own rendering)
+- **CVD chart**: Custom Canvas 2D with zoom/fullscreen support
+- **Other panels** (orderbook heatmap, trade tape, OI/Funding/Basis, volume profile, scenario cards, screener): Canvas 2D rendering
 
-This eliminates DOM node overhead and allows 60fps rendering of complex financial data.
+### Activity Log
+
+React DOM component with performance optimizations:
+- `React.useMemo` for filtered alerts
+- **Only 50 items rendered** in DOM (`.slice(0, 50)`), even if 200 alerts are stored
+- Alert cap: 200 max in state (oldest pruned on new alert)
+- Filter buttons for 7 signal types + exchange filter
 
 ### Performance Optimizations (Implemented)
 
-High-frequency data (candle ticks, CVD ticks) uses a **mutable ref + throttled React sync** pattern to avoid main thread blocking:
+**Frontend:**
+1. **Mutable stores**: `candleStoreRef` and `cvdStoreRef` hold candle/CVD arrays as plain mutable refs. Tick handlers mutate in-place (zero array copies)
+2. **Throttled React sync**: React state only updated at max 2x/sec via timestamp gating
+3. **Client-side candle pruning**: Arrays pruned at 5000 entries (spliced to 4500) to prevent memory growth
+4. **Activity Log DOM limit**: Only 50 items rendered regardless of alert count
+5. **Datafeed bar cache**: Pre-computed bar arrays cached by `symbol:resolution`, invalidated on data change
 
-1. **Mutable stores**: `candleStoreRef` and `cvdStoreRef` hold candle/CVD arrays as plain mutable refs. Tick handlers mutate these in-place (zero array copies)
-2. **Throttled React sync**: React state (`setCandlesByExchange`, `setCvdData`) is only updated at max 2x/sec via timestamp gating, not on every tick
-3. **Cached aggregation**: `aggregateCandles()` results are cached per frame (cache key = `length-lastTime-tfSec`), avoiding recomputation at 60fps
-4. **O(1) overlay lookups**: A `timeToIdx` Map is built once per data change, replacing O(n) `findIndex` calls for multi-exchange overlay rendering
-5. **Reduced broadcast frequency**: `candle_tick` at 500ms (not 100ms), full `candles` at 30s (not 5s)
-
-The Chart's rAF loop reads exclusively from refs — it never triggers or depends on React re-renders.
+**Backend:**
+6. **Trade batch processing** (100ms): Trades buffered and processed in bulk. Cheap ops run for every trade, expensive ops once per batch
+7. **Deferred candle:close** (500ms queue): Structure/FVG/OB analysis deferred with per-timeframe deduplication
+8. **Alert batching** (200ms flush): Alerts queued and broadcast in batches, not individually
+9. **Detector throttling** (20Hz max): `DETECTOR_MIN_INTERVAL_MS = 50` prevents detector spam during big moves
+10. **CircularBuffer binary search**: `getRecent(ms)` uses binary search on sorted buffer (O(log n) vs O(n))
+11. **Initial sync only**: Full candle/CVD data sent once on client connect, then incremental ticks only
+12. **Performance monitoring**: `[PERF]` logs every 10s (trades/sec, batch timing, event loop lag)
 
 ---
 
@@ -682,6 +668,7 @@ MACKUANT is a comprehensive BTC-focused trading intelligence platform that:
 5. **Tracks** derivatives data (OI, funding, basis) from 4 exchanges via REST polling
 6. **Maintains** VWAP + σ bands and volume profile in real-time
 7. **Scores** signal confluence across 16 weighted categories and generates trade scenarios matched against 10 predefined templates
-8. **Renders** everything on a custom Canvas 2D chart with candlesticks, multi-exchange overlays, structure annotations, and interactive crosshair
+8. **Renders** the main chart via TradingView Charting Library with a custom datafeed, plus Canvas 2D for CVD, orderbook heatmap, and other panels
+9. **Optimized** for high-throughput via trade batch processing (100ms), deferred candle:close analysis (500ms), alert batching (200ms), bar caching with binary search, and initial-sync-only candle delivery
 
 All of this runs on a single Node.js process with a React frontend, communicating over a single WebSocket connection.

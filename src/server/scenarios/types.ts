@@ -31,7 +31,15 @@ export interface ConfluenceConfig {
 
 export type ScenarioDirection = 'LONG' | 'SHORT';
 export type ScenarioPriority = 'LOW' | 'MEDIUM' | 'HIGH' | 'EXTREME';
-export type ScenarioStatus = 'PENDING' | 'ACTIVE' | 'TRIGGERED' | 'INVALIDATED' | 'EXPIRED';
+export type ScenarioStatus =
+  | 'PENDING'
+  | 'ACTIVE'
+  | 'TP1_HIT'        // TP1 atteint, tracking continue
+  | 'TP2_HIT'        // TP2 atteint, tracking continue
+  | 'TP3_HIT'        // TP3 atteint, scénario complètement réussi
+  | 'TRIGGERED'      // legacy alias for TP1_HIT
+  | 'INVALIDATED'
+  | 'EXPIRED';
 
 export interface SignalContribution {
   name: string;         // e.g. "CHoCH", "OB Retest", "Absorption", "VWAP Discount"
@@ -75,6 +83,31 @@ export interface TradeScenario {
   // Context
   timeframe: string;            // primary TF of the setup
   currentPrice: number;
+
+  // Scoring meta (Phase 1.1 + 1.2)
+  meta?: {
+    rawScore: number;
+    trendScore: number;
+    trendMultiplier: number;
+    adjustedScore: number;
+    hasAnchorSignal: boolean;
+    clusterBonus: number;
+  };
+
+  // TP tracking (Phase 2.3)
+  tp1HitTime?: number;
+  tp1HitPrice?: number;
+  tp2HitTime?: number;
+  tp2HitPrice?: number;
+  tp3HitTime?: number;
+  tp3HitPrice?: number;
+  exitPrice?: number;
+  exitTime?: number;
+  exitReason?: string;
+
+  // Excursion tracking (Phase 4)
+  maxFavorableExcursion?: number;
+  maxAdverseExcursion?: number;
 }
 
 // Signal event fed into the confluence engine

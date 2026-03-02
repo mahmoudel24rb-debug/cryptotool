@@ -70,7 +70,7 @@ export default function App() {
   useEffect(() => {
     const unsub = subscribe('alert', (msg) => {
       const alert = msg.data as Alert;
-      setAlerts(prev => [alert, ...prev].slice(0, 500));
+      setAlerts(prev => [alert, ...prev].slice(0, 200));
 
       if (alert.type === 'SPIKE') {
         setLastSpike(`[${alert.exchange}:${alert.symbol}] ${alert.message}`);

@@ -235,8 +235,11 @@ export function startEngine(
     scenarioExpirationMs: conflConfig.scenarioExpirationMs ?? 1800000,
     maxActiveScenarios: conflConfig.maxActiveScenarios ?? 5,
     minRiskReward: conflConfig.minRiskReward ?? 1.5,
-    slBufferPercent: conflConfig.slBufferPercent ?? 0.1,
+    slBufferPercent: conflConfig.slBufferPercent ?? 0.2,
   });
+
+  // Phase 1.1: Inject TrendAnalyzer into ConfluenceEngine
+  confluenceEngine.setTrendProvider(trendAnalyzer);
 
   confluenceEngine.onScenario((event, scenario) => {
     broadcast(event, scenario);
