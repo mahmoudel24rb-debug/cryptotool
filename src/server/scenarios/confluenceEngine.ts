@@ -33,7 +33,7 @@ export const SCENARIO_CONFIG = {
 
   // Phase 3.1 — Scoring avancé
   DECAY_RATE: 0.7,
-  TF_MULTIPLIERS: { '1m': 0.8, '5m': 1.0, '15m': 1.3, '1h': 1.5 } as Record<string, number>,
+  TF_MULTIPLIERS: { '1m': 0.6, '5m': 1.0, '15m': 1.4, '1h': 1.6 } as Record<string, number>,
   PROXIMITY_MAX_DISTANCE: 0.01,      // 1% max distance for proximity factor
 
   // Phase 3.2 — Clustering temporel
@@ -42,7 +42,30 @@ export const SCENARIO_CONFIG = {
   CLUSTER_BONUS_LOW: 5,              // 1-2 paires
 
   // Phase 3.3 — Signal anchor minimum
-  MINIMUM_ANCHOR_WEIGHT: 10,         // au moins 1 signal poids >= 10
+  MINIMUM_ANCHOR_WEIGHT: 15,         // au moins 1 signal poids >= 15 (OB, SWEEP, STRUCTURE)
+
+  // Counter-trend blocking
+  TREND_HARD_BLOCK_THRESHOLD: 60,    // |trendScore| above → block ALL counter-trend
+  TREND_SOFT_BLOCK_THRESHOLD: 30,    // |trendScore| above → require high rawScore for counter-trend
+  COUNTER_TREND_MIN_RAW_SCORE: 50,   // minimum rawScore for counter-trend in moderate trend
+
+  // Cross-template deduplication
+  DEDUP_OVERLAP_THRESHOLD: 0.5,      // 50% entry zone overlap = same trade
+
+  // SL cooldown after stop-loss hit
+  SL_COOLDOWN_MS: 300_000,           // 5 min cooldown after SL
+  SL_COOLDOWN_OVERRIDE_SCORE: 55,    // HIGH score can bypass cooldown
+
+  // ATR-based stop loss
+  SL_MODE: 'ATR' as 'ATR' | 'FIXED',
+  ATR_SL_MULTIPLIER: 1.0,
+  MIN_SL_BUFFER_PCT: 0.001,          // 0.1% floor
+
+  // Entry & TP
+  ENTRY_BUFFER_PCT: 0.0015,          // 0.15% entry buffer
+  TP1_MULTIPLIER: 1.0,
+  TP2_MULTIPLIER: 2.0,
+  TP3_MULTIPLIER: 3.5,
 
   // Phase 1.4 — TTL par type de signal (ms)
   SIGNAL_TTL_MS: {
@@ -89,7 +112,7 @@ const DEFAULT_CONFIG: ConfluenceConfig = {
     fairValueGap: 10,
     liquiditySweep: 20,
     absorption: 10,
-    divergence: 8,
+    divergence: 5,
     spike: 5,
     velocity: 5,
     twap: 5,
@@ -101,12 +124,12 @@ const DEFAULT_CONFIG: ConfluenceConfig = {
     vwapPosition: 5,
     volumeProfile: 5,
   },
-  minScoreForScenario: 30,
-  highPriorityThreshold: 55,
+  minScoreForScenario: 40,
+  highPriorityThreshold: 60,
   extremePriorityThreshold: 75,
   signalTimeWindowMs: 300000,       // fallback, overridden by per-signal TTL
   scenarioExpirationMs: 1800000,
-  maxActiveScenarios: 5,
+  maxActiveScenarios: 3,
   minRiskReward: 1.5,
   slBufferPercent: 0.2,             // Phase 2.1: 0.1 → 0.2%
 };
@@ -209,6 +232,8 @@ export class ConfluenceEngine {
   private activeScenarios: TradeScenario[] = [];
   private scenarioCallback: ((event: string, scenario: TradeScenario) => void) | null = null;
   private currentPrice = 0;
+  private currentATR = 0;
+  private lastSLTimestamp: Record<string, number> = { LONG: 0, SHORT: 0 };
   private trendProvider: TrendProvider | null = null;
 
   constructor(config: Partial<ConfluenceConfig> = {}) {
@@ -238,6 +263,10 @@ export class ConfluenceEngine {
 
   updatePrice(price: number): void {
     this.currentPrice = price;
+  }
+
+  updateATR(atr: number): void {
+    if (atr > 0) this.currentATR = atr;
   }
 
   /** Feed a new signal into the engine — triggers evaluation */
@@ -303,13 +332,27 @@ export class ConfluenceEngine {
         scoreWithCluster, direction,
       );
 
+      // Counter-trend blocking (TIER 1.2)
+      const isCounter = (direction === 'LONG' && trendScore < 0) || (direction === 'SHORT' && trendScore > 0);
+      if (isCounter) {
+        const absTrend = Math.abs(trendScore);
+        // Hard block: strong trend → no counter-trend at all
+        if (absTrend > SCENARIO_CONFIG.TREND_HARD_BLOCK_THRESHOLD) continue;
+        // Soft block: moderate trend → require high raw confluence
+        if (absTrend > SCENARIO_CONFIG.TREND_SOFT_BLOCK_THRESHOLD && rawScore < SCENARIO_CONFIG.COUNTER_TREND_MIN_RAW_SCORE) continue;
+      }
+
       if (adjustedScore < this.config.minScoreForScenario) continue;
+
+      // SL cooldown check (TIER 3.2)
+      const timeSinceLastSL = Date.now() - (this.lastSLTimestamp[direction] || 0);
+      if (timeSinceLastSL < SCENARIO_CONFIG.SL_COOLDOWN_MS && adjustedScore < SCENARIO_CONFIG.SL_COOLDOWN_OVERRIDE_SCORE) continue;
 
       // Try to match a template
       const template = matchTemplate(zone, direction, contributions);
       if (!template) continue;
 
-      // Check if we already have a similar scenario
+      // Check if we already have a similar scenario (same template)
       if (this.isDuplicate(template, direction)) continue;
 
       // Build the scenario
@@ -317,6 +360,9 @@ export class ConfluenceEngine {
         template, direction, adjustedScore, maxScore, contributions, zone,
       );
       if (!scenario) continue;
+
+      // Cross-template dedup by entry zone overlap (TIER 3.1)
+      if (this.isDuplicateByZone(direction, scenario.entryLow, scenario.entryHigh, adjustedScore)) continue;
 
       // Attach scoring meta
       scenario.meta = {
@@ -519,6 +565,45 @@ export class ConfluenceEngine {
     );
   }
 
+  /** Cross-template dedup: check if entry zone overlaps existing scenario */
+  private isDuplicateByZone(
+    direction: ScenarioDirection,
+    entryLow: number,
+    entryHigh: number,
+    adjustedScore: number,
+  ): boolean {
+    for (const existing of this.activeScenarios) {
+      if (existing.direction !== direction) continue;
+      if (existing.status !== 'PENDING' && existing.status !== 'ACTIVE') continue;
+
+      const overlapLow = Math.max(existing.entryLow, entryLow);
+      const overlapHigh = Math.min(existing.entryHigh, entryHigh);
+      if (overlapLow >= overlapHigh) continue;
+
+      const overlapSize = overlapHigh - overlapLow;
+      const minZoneSize = Math.min(
+        existing.entryHigh - existing.entryLow,
+        entryHigh - entryLow,
+      );
+      if (minZoneSize <= 0) continue;
+
+      const overlap = overlapSize / minZoneSize;
+      if (overlap >= SCENARIO_CONFIG.DEDUP_OVERLAP_THRESHOLD) {
+        // If new score is higher, replace the existing one
+        if (adjustedScore > existing.score) {
+          existing.status = 'INVALIDATED';
+          existing.invalidationReason = 'Replaced by higher-score scenario in same zone';
+          this.emit('scenario:invalidated', existing);
+          this.logOutcome(existing);
+          this.activeScenarios = this.activeScenarios.filter(s => s.id !== existing.id);
+          return false; // allow the new one
+        }
+        return true; // existing is better, skip
+      }
+    }
+    return false;
+  }
+
   // ═══════════════════════════════════════════════════════════
   // Phase 2.1: Wider entry zone / SL
   // ═══════════════════════════════════════════════════════════
@@ -534,9 +619,17 @@ export class ConfluenceEngine {
     const price = this.currentPrice;
     if (price <= 0) return null;
 
-    const slBuffer = price * (this.config.slBufferPercent / 100);
-    // Phase 2.1: Entry zone buffer is wider than SL buffer
-    const entryBuffer = price * 0.003; // 0.3%
+    // ATR-based SL or fixed fallback
+    let slBuffer: number;
+    if (SCENARIO_CONFIG.SL_MODE === 'ATR' && this.currentATR > 0) {
+      slBuffer = Math.max(
+        price * SCENARIO_CONFIG.MIN_SL_BUFFER_PCT,
+        this.currentATR * SCENARIO_CONFIG.ATR_SL_MULTIPLIER,
+      );
+    } else {
+      slBuffer = price * (this.config.slBufferPercent / 100);
+    }
+    const entryBuffer = price * SCENARIO_CONFIG.ENTRY_BUFFER_PCT;
 
     // Find zone bounds from signals
     const zonePrices = signals.map(s => s.price);
@@ -552,18 +645,18 @@ export class ConfluenceEngine {
       entryHigh = Math.max(zoneHigh, price) + entryBuffer;
       stopLoss = entryLow - slBuffer;
       const risk = entryHigh - stopLoss;
-      tp1 = entryHigh + risk * 1.5;
-      tp2 = entryHigh + risk * 2.5;
-      tp3 = entryHigh + risk * 4;
+      tp1 = entryHigh + risk * SCENARIO_CONFIG.TP1_MULTIPLIER;
+      tp2 = entryHigh + risk * SCENARIO_CONFIG.TP2_MULTIPLIER;
+      tp3 = entryHigh + risk * SCENARIO_CONFIG.TP3_MULTIPLIER;
       invalidationPrice = stopLoss - slBuffer;
     } else {
       entryLow = Math.min(zoneLow, price) - entryBuffer;
       entryHigh = Math.max(zoneHigh, price) + entryBuffer;
       stopLoss = entryHigh + slBuffer;
       const risk = stopLoss - entryLow;
-      tp1 = entryLow - risk * 1.5;
-      tp2 = entryLow - risk * 2.5;
-      tp3 = entryLow - risk * 4;
+      tp1 = entryLow - risk * SCENARIO_CONFIG.TP1_MULTIPLIER;
+      tp2 = entryLow - risk * SCENARIO_CONFIG.TP2_MULTIPLIER;
+      tp3 = entryLow - risk * SCENARIO_CONFIG.TP3_MULTIPLIER;
       invalidationPrice = stopLoss + slBuffer;
     }
 
@@ -573,11 +666,11 @@ export class ConfluenceEngine {
     const rewardAmt = Math.abs(tp2 - entryMid);
     const rr = riskAmt > 0 ? rewardAmt / riskAmt : 0;
 
-    // Determine priority
+    // Determine priority (LOW≥40, MEDIUM≥50, HIGH≥60, EXTREME≥75)
     let priority: ScenarioPriority = 'LOW';
     if (score >= this.config.extremePriorityThreshold) priority = 'EXTREME';
     else if (score >= this.config.highPriorityThreshold) priority = 'HIGH';
-    else if (score >= this.config.minScoreForScenario + 10) priority = 'MEDIUM';
+    else if (score >= 50) priority = 'MEDIUM';
 
     // Determine timeframe
     const tfSignal = signals.find(s => s.timeframe);
@@ -682,6 +775,8 @@ export class ConfluenceEngine {
           sc.exitPrice = price;
           sc.exitTime = now;
           sc.exitReason = sc.invalidationReason;
+          // Track SL timestamp for cooldown (TIER 3.2)
+          this.lastSLTimestamp[sc.direction] = now;
           this.emit('scenario:invalidated', sc);
           this.logOutcome(sc);
           continue;

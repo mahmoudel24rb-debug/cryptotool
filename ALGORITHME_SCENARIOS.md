@@ -6,50 +6,53 @@ Le systeme genere des scenarios de trade en combinant des **signaux** provenant 
 
 ```
 Signaux (16 types) --> Regroupement par zone de prix --> Score de confluence
-    --> Match template (10 modeles) --> Calcul TP/SL --> Emission scenario
+    --> Cluster bonus --> Trend multiplier --> Counter-trend blocking
+    --> Seuil minimum (40) --> SL cooldown check
+    --> Match template (10 modeles) --> Cross-template dedup
+    --> Calcul TP/SL (ATR-based) --> Emission scenario
 ```
 
 ---
 
 ## 1. Les 16 Types de Signaux
 
-Chaque signal a un **poids** qui determine son importance dans le score final.
+Chaque signal a un **poids** qui determine son importance dans le score final, et un **strength** (0 a 1) qui module ce poids.
 
 ### Signaux Structure (poids eleves = plus fiables)
 
-| Signal | Poids | Source | Description |
-|--------|-------|--------|-------------|
-| **ORDER_BLOCK** | 20 | Structure Analyzer | Zone ou les institutionnels ont accumule. Retest = entree probable |
-| **LIQUIDITY_SWEEP** | 20 | Structure Analyzer | Balayage de liquidite (stop hunt) suivi d'un retournement |
-| **STRUCTURE (BOS/CHoCH)** | 15 | Structure Analyzer | Break of Structure / Change of Character = changement de tendance |
+| Signal | Poids | TTL | Source | Description |
+|--------|-------|-----|--------|-------------|
+| **ORDER_BLOCK** | 20 | 15 min | Structure Analyzer | Zone ou les institutionnels ont accumule. Retest = entree probable |
+| **LIQUIDITY_SWEEP** | 20 | 10 min | Structure Analyzer | Balayage de liquidite (stop hunt) suivi d'un retournement |
+| **STRUCTURE (BOS/CHoCH)** | 15 | 10 min | Structure Analyzer | Break of Structure / Change of Character = changement de tendance |
 
 ### Signaux Order Flow (poids moyens)
 
-| Signal | Poids | Source | Description |
-|--------|-------|--------|-------------|
-| **ABSORPTION** | 10 | Detector | Gros volume absorbe sans mouvement de prix = mur d'ordres |
-| **FVG** | 10 | Structure Analyzer | Fair Value Gap = desequilibre a combler |
-| **DIVERGENCE** | 8 | Detector | Prix monte mais delta descend (ou inverse) = faiblesse cachee |
-| **LIQUIDATION** | 8 | Detector | Cascade de liquidations forcees |
+| Signal | Poids | TTL | Source | Description |
+|--------|-------|-----|--------|-------------|
+| **ABSORPTION** | 10 | 5 min | Detector | Gros volume absorbe sans mouvement de prix = mur d'ordres |
+| **FVG** | 10 | 15 min | Structure Analyzer | Fair Value Gap = desequilibre a combler |
+| **DIVERGENCE** | 5 | 5 min | Detector | Prix monte mais delta descend (ou inverse) = faiblesse cachee |
+| **LIQUIDATION** | 8 | 3 min | Detector | Cascade de liquidations forcees |
 
 ### Signaux Derivatives (poids moyens)
 
-| Signal | Poids | Source | Description |
-|--------|-------|--------|-------------|
-| **FUNDING_EXTREME** | 8 | Funding Tracker | Funding rate anormalement eleve/bas = desequilibre |
-| **OI (Surge/Flush/Divergence)** | 8 | OI Tracker | Open Interest change significativement |
-| **BASIS_EXTREME** | 5 | Basis Tracker | Ecart futures/spot anormal (contango/backwardation) |
+| Signal | Poids | TTL | Source | Description |
+|--------|-------|-----|--------|-------------|
+| **FUNDING_EXTREME** | 8 | 8 min | Funding Tracker | Funding rate anormalement eleve/bas = desequilibre |
+| **OI (Surge/Flush/Divergence)** | 8 | 8 min | OI Tracker | Open Interest change significativement |
+| **BASIS_EXTREME** | 5 | 5 min | Basis Tracker | Ecart futures/spot anormal (contango/backwardation) |
 
 ### Signaux Faibles (confirmation)
 
-| Signal | Poids | Source | Description |
-|--------|-------|--------|-------------|
-| **SPIKE** | 5 | Detector | Pic de volume soudain |
-| **VELOCITY** | 5 | Detector | Acceleration rapide du prix |
-| **TWAP** | 5 | Detector | Detection d'execution algorithmique (Time-Weighted Average Price) |
-| **EXHAUSTION** | 5 | Detector | Volume qui s'epuise = fin de mouvement |
-| **VWAP_POSITION** | 5 | VWAP Calculator | Prix par rapport aux bandes VWAP |
-| **VOLUME_PROFILE** | 5 | Volume Profile | Proximite du Point of Control (POC) |
+| Signal | Poids | TTL | Source | Description |
+|--------|-------|-----|--------|-------------|
+| **SPIKE** | 5 | 2 min | Detector | Pic de volume soudain |
+| **VELOCITY** | 5 | 2 min | Detector | Acceleration rapide du prix |
+| **TWAP** | 5 | 5 min | Detector | Detection d'execution algorithmique (Time-Weighted Average Price) |
+| **EXHAUSTION** | 5 | 3 min | Detector | Volume qui s'epuise = fin de mouvement |
+| **VWAP_POSITION** | 5 | 5 min | VWAP Calculator | Prix aux extremes des bandes VWAP (±2 sigma) |
+| **VOLUME_PROFILE** | 5 | 5 min | Volume Profile | Proximite du Point of Control (POC) |
 
 ---
 
@@ -61,11 +64,6 @@ Les signaux ne sont utiles que s'ils pointent vers la **meme zone**. L'algorithm
 2. Regroupe les signaux dont le prix est a **< 0.3%** les uns des autres
 3. Ajoute une zone "near-price" : tous les signaux a **< 1%** du prix actuel
 4. **Minimum 2 signaux** par zone pour etre evaluee
-
-**Exemple :**
-- Signal ORDER_BLOCK a $86,500
-- Signal ABSORPTION a $86,700 (0.23% d'ecart -> meme zone)
-- Signal SPIKE a $87,500 (1.15% d'ecart -> nouvelle zone)
 
 ---
 
@@ -80,122 +78,166 @@ Chaque signal a une direction. Les poids pondent le vote :
 - Signaux SHORT : somme des poids = score baissier
 - La direction majoritaire l'emporte
 
-**Exemple :** ORDER_BLOCK(LONG, 20) + FVG(LONG, 10) + SPIKE(SHORT, 5) = LONG (30 vs 5)
+### 3.2 Verifie l'ancrage (Anchor Check)
 
-### 3.2 Calcule le score
+Au moins **1 signal de poids >= 15** doit etre present dans la direction choisie. Les signaux eligibles sont : STRUCTURE/BOS/CHoCH (15), ORDER_BLOCK (20), LIQUIDITY_SWEEP (20).
+
+Si aucun signal structurel "fort" n'est present, la zone est ignoree. Cela force la presence d'un signal de structure de marche (OB, sweep, ou BOS/CHoCH).
+
+### 3.3 Calcule le score avec decay, proximite et strength
+
+Pour chaque signal **dans la direction** :
 
 ```
-Pour chaque signal dans la zone :
-  - Si meme direction que la zone :
-      - Ajoute le poids au score (une seule fois par TYPE de signal)
-  - Si direction opposee :
-      - Soustrait 30% du poids (penalite contra)
+strength  = max(0.3, signal.strength ?? 1.0)     // floor a 30%
+decay     = max(0, 1.0 - (age / ttl) * 0.7)      // perd de la valeur avec l'age
+proximity = max(0, 1.0 - distance / 0.01)          // perd de la valeur si loin du prix actuel
+tfMult    = TF_MULTIPLIERS[timeframe] ?? 1.0       // 1m=0.6, 5m=1.0, 15m=1.4, 1h=1.6
+
+effectiveScore = round(poids * strength * decay * proximity * tfMult)
 ```
 
-**Deduplication importante :** Deux signaux ORDER_BLOCK dans la meme zone ne comptent que pour **20 points** (pas 40). Chaque categorie ne compte qu'une fois.
+**Deduplication :** Un seul signal par TYPE dans le score (garde le meilleur effectiveScore).
 
-**Exemple de calcul :**
+Pour chaque signal **contra** (direction opposee) :
+
 ```
-Zone LONG :
-  + CHoCH (LONG)       = +15
-  + ORDER_BLOCK (LONG)  = +20
-  + FVG (LONG)          = +10
-  + ABSORPTION (LONG)   = +10
-  - SPIKE (SHORT)       = -floor(5 * 0.3) = -1
-                        ────────
-  Score = 54 / maxScore = 60
+penalite = floor(poids * strength * penaltyRatio)
+
+penaltyRatio :
+  0.70 si poids >= 15  (ORDER_BLOCK, LIQUIDITY_SWEEP, STRUCTURE contra = gros red flag)
+  0.50 si poids >= 8   (ABSORPTION, FVG, DIVERGENCE, etc.)
+  0.30 si poids < 8    (SPIKE, VELOCITY, etc.)
 ```
 
-### 3.3 Seuils de priorite
+`rawScore = max(0, somme_alignes - somme_contras)`
+
+### 3.4 Bonus de clustering temporel
+
+Si plusieurs signaux apparaissent dans une fenetre de **30 secondes** (convergence rapide) :
+- 3+ paires de signaux proches temporellement → **+10 points**
+- 1-2 paires → **+5 points**
+
+`scoreWithCluster = rawScore + clusterBonus`
+
+### 3.5 Multiplicateur de tendance
+
+Le Trend Analyzer fournit un score de -100 a +100. Le scenario est compare a la tendance :
+
+```
+Si aligne (LONG + trend positif, ou SHORT + trend negatif) :
+  trendMultiplier = 1.0 + (|trendScore| / 100) * 0.25     // max +25%
+
+Si contre-tendance :
+  trendMultiplier = 1.0 - (|trendScore| / 100) * 0.40     // max -40%
+
+adjustedScore = round(scoreWithCluster * trendMultiplier)
+```
+
+**Blocage counter-trend :**
+- Si `|trendScore| > 60` (tendance forte) : **blocage total** des scenarios counter-trend
+- Si `|trendScore| > 30` (tendance moderee) ET `rawScore < 50` : **blocage** (pas assez de confluence brute)
+- Si `|trendScore| < 30` (range/neutre) : comportement normal (penalite proportionnelle)
+
+### 3.6 Cooldown apres Stop Loss
+
+Apres un SL dans une direction, **5 minutes de cooldown** dans cette meme direction. Seuls les scenarios avec `adjustedScore >= 55` (HIGH) peuvent bypass le cooldown.
+
+### 3.7 Seuils de priorite
 
 | Priorite | Score minimum | Signification |
 |----------|---------------|---------------|
-| **LOW** | >= 30 | Confluence basique (2-3 signaux) |
-| **MEDIUM** | >= 40 | Confluence moderee |
-| **HIGH** | >= 55 | Forte confluence (3-4 signaux majeurs) |
+| **LOW** | >= 40 | Confluence basique (3+ signaux) |
+| **MEDIUM** | >= 50 | Confluence moderee |
+| **HIGH** | >= 60 | Forte confluence (signaux majeurs) |
 | **EXTREME** | >= 75 | Confluence exceptionnelle (rare) |
+
+### 3.8 Exemple de calcul complet
+
+**Situation :** BTC a $90,000, trend score = +45 (BULL)
+
+| Signal | Type | Poids | Strength | Age | TTL | Decay | Dist | Prox | TF | Score |
+|--------|------|-------|----------|-----|-----|-------|------|------|----|-------|
+| CHoCH BULLISH | STRUCTURE | 15 | 0.8 | 2m | 10m | 0.86 | 0.06% | 0.94 | 15m (1.4) | **14** |
+| OB BULLISH | ORDER_BLOCK | 20 | 0.7 | 4m | 15m | 0.81 | 0.11% | 0.89 | 5m (1.0) | **10** |
+| FVG BULLISH | FVG | 10 | 0.6 | 1m | 15m | 0.95 | 0.06% | 0.94 | 1m (0.6) | **3** |
+| SPIKE SELL (contra) | SPIKE | 5 | 0.5 | 30s | 2m | — | — | — | — | **-0** |
+
+```
+rawScore       = 14 + 10 + 3 - 0 = 27
+clusterBonus   = +5 (1 paire dans 30s)
+scoreWithCluster = 32
+counterTrend?  = Non (LONG + trend positif)
+trendMultiplier = 1.0 + (45/100) * 0.25 = 1.1125
+adjustedScore  = round(32 * 1.1125) = 36
+SL cooldown?   = Non
+```
+
+Resultat : score 36, **en dessous du seuil de 40** → scenario rejete.
 
 ---
 
 ## 4. Les 10 Templates de Scenarios
 
-Chaque scenario doit correspondre a un **template** predefined. Le template determine le contexte du trade.
+Chaque scenario doit correspondre a un **template** predefini. Le meilleur match gagne (score = requiredMatched * 10 + bonusMatched * 5).
 
-### Template 1 : OB Retest apres CHoCH
-- **Requis :** CHoCH + ORDER_BLOCK (les 2 obligatoires)
-- **Bonus :** FVG, ABSORPTION, VWAP
-- **Logique :** Le marche a change de structure (CHoCH), puis revient tester un order block = entree classique smart money
+| # | Nom | Requis | Bonus | Direction |
+|---|-----|--------|-------|-----------|
+| 1 | OB Retest apres CHoCH | CHoCH + ORDER_BLOCK | FVG, ABSORPTION, VWAP | — |
+| 2 | Liquidity Sweep + Reversal | LIQUIDITY_SWEEP | ORDER_BLOCK, ABSORPTION, LIQUIDATION | — |
+| 3 | FVG Fill + Continuation | BOS + FVG | ORDER_BLOCK, VWAP | — |
+| 4 | Cascade de Liquidation | LIQUIDATION + FUNDING_EXTREME | ABSORPTION, ORDER_BLOCK, OI_SURGE | — |
+| 5 | Short Squeeze Setup | FUNDING_EXTREME + STRUCTURE | VELOCITY, SPIKE, FVG, ORDER_BLOCK | LONG |
+| 6 | Long Squeeze Setup | FUNDING_EXTREME + STRUCTURE | VELOCITY, SPIKE, FVG, ORDER_BLOCK | SHORT |
+| 7 | VWAP Mean Reversion | VWAP_POSITION + EXHAUSTION | ORDER_BLOCK, FVG, ABSORPTION | — |
+| 8 | POC Rejection | VOLUME_PROFILE + ABSORPTION | STRUCTURE, VWAP | — |
+| 9 | TWAP Accumulation Breakout | TWAP + FVG | OI_SURGE, STRUCTURE, SPIKE | — |
+| 10 | Multi-Exchange Divergence | DIVERGENCE + (ABSORPTION ou STRUCTURE) | BASIS_EXTREME, SPIKE, VELOCITY | — |
 
-### Template 2 : Liquidity Sweep + Reversal
-- **Requis :** LIQUIDITY_SWEEP (1 seul suffit)
-- **Bonus :** ORDER_BLOCK, ABSORPTION, LIQUIDATION
-- **Logique :** Le prix balaye les stops (sweep), puis les institutionnels entrent en sens inverse
-
-### Template 3 : FVG Fill + Continuation
-- **Requis :** BOS + FVG (les 2 obligatoires)
-- **Bonus :** ORDER_BLOCK, VWAP
-- **Logique :** Break of Structure confirme la tendance, le prix revient combler un FVG avant de continuer
-
-### Template 4 : Cascade de Liquidation
-- **Requis :** LIQUIDATION + FUNDING_EXTREME (les 2 obligatoires)
-- **Bonus :** ABSORPTION, ORDER_BLOCK, OI_SURGE
-- **Logique :** Funding extreme + liquidations en cours = mouvement force en cascade
-
-### Template 5 : Short Squeeze Setup (LONG uniquement)
-- **Requis :** FUNDING_EXTREME + STRUCTURE
-- **Bonus :** VELOCITY, SPIKE, FVG, ORDER_BLOCK
-- **Logique :** Funding tres negatif + structure haussiere = les shorts vont se faire liquider
-
-### Template 6 : Long Squeeze Setup (SHORT uniquement)
-- **Requis :** FUNDING_EXTREME + STRUCTURE
-- **Bonus :** VELOCITY, SPIKE, FVG, ORDER_BLOCK
-- **Logique :** Funding tres positif + structure baissiere = les longs vont se faire liquider
-
-### Template 7 : VWAP Mean Reversion
-- **Requis :** VWAP_POSITION + EXHAUSTION
-- **Bonus :** ORDER_BLOCK, FVG, ABSORPTION
-- **Logique :** Prix aux extremes du VWAP + volume en exhaustion = retour vers la moyenne
-
-### Template 8 : POC Rejection
-- **Requis :** VOLUME_PROFILE + ABSORPTION
-- **Bonus :** STRUCTURE, VWAP
-- **Logique :** Le prix touche le Point of Control et est rejete (absorption visible)
-
-### Template 9 : TWAP Accumulation Breakout
-- **Requis :** TWAP + FVG
-- **Bonus :** OI_SURGE, STRUCTURE, SPIKE
-- **Logique :** Detection d'accumulation algo (TWAP) + FVG = breakout programme
-
-### Template 10 : Multi-Exchange Divergence
-- **Requis :** DIVERGENCE (1 seul suffit)
-- **Bonus :** BASIS_EXTREME, SPIKE, VELOCITY
-- **Logique :** Divergence delta/prix entre exchanges = mouvement cache imminent
+**Validation squeeze :**
+- Template 5 (Short Squeeze, LONG) : le funding doit etre negatif (`direction === 'LONG'` = shorts paient)
+- Template 6 (Long Squeeze, SHORT) : le funding doit etre positif (`direction === 'SHORT'` = longs paient)
 
 ---
 
 ## 5. Calcul des TP / SL
 
-### Stop Loss
+### Zone d'entree
 ```
-Buffer = prix * 0.1% (environ $87 pour BTC a $87K)
+entryBuffer = prix * 0.15%    (~$135 pour BTC a $90K)
 
-LONG :  SL = bord bas de la zone d'entree - buffer
-SHORT : SL = bord haut de la zone d'entree + buffer
+LONG :  entryLow  = min(prix_signaux) - entryBuffer
+        entryHigh = max(prix_signaux) + entryBuffer
+SHORT : idem
+```
+
+### Stop Loss (ATR-based)
+```
+Mode ATR (defaut) :
+  slBuffer = max(prix * 0.1%, ATR(14) * 1.0)
+  → S'adapte a la volatilite : plus serre en range, plus large en tendance
+
+Mode fixe (fallback si ATR pas dispo) :
+  slBuffer = prix * 0.2%
+
+LONG :  SL = entryLow - slBuffer
+SHORT : SL = entryHigh + slBuffer
 ```
 
 ### Take Profit (multiples du risque)
 ```
-Risque = distance entree -> SL
+risk = entryHigh - stopLoss   (LONG)
+     = stopLoss - entryLow    (SHORT)
 
 LONG :
-  TP1 = entree + risque * 1.5   (premier objectif, conservative)
-  TP2 = entree + risque * 2.5   (objectif principal)
-  TP3 = entree + risque * 4.0   (objectif ambitieux)
+  TP1 = entryHigh + risk * 1.0   (premier objectif, conservateur)
+  TP2 = entryHigh + risk * 2.0   (objectif principal)
+  TP3 = entryHigh + risk * 3.5   (objectif ambitieux)
 
 SHORT :
-  TP1 = entree - risque * 1.5
-  TP2 = entree - risque * 2.5
-  TP3 = entree - risque * 4.0
+  TP1 = entryLow - risk * 1.0
+  TP2 = entryLow - risk * 2.0
+  TP3 = entryLow - risk * 3.5
 ```
 
 ### Risk/Reward minimum
@@ -211,105 +253,148 @@ SHORT :
 ## 6. Cycle de Vie d'un Scenario
 
 ```
-   PENDING ──────> ACTIVE ──────> TRIGGERED (TP1 atteint)
-     │                │
-     │                └──> INVALIDATED (SL touche)
-     │
-     └──> EXPIRED (30 min ecoulees)
-     └──> INVALIDATED (prix au-dela de l'invalidation)
+PENDING ──> ACTIVE ──> TP1_HIT ──> TP2_HIT ──> TP3_HIT
+   │           │          │           │
+   │           │          │           └── INVALIDATED (SL)
+   │           │          └── INVALIDATED (SL au breakeven)
+   │           └── INVALIDATED (SL)
+   │
+   ├── EXPIRED (30 min, seulement si adjustedScore < 40)
+   └── INVALIDATED (prix au-dela de l'invalidation)
 ```
+
+### Etats
 
 - **PENDING** : Scenario cree, en attente que le prix entre dans la zone
 - **ACTIVE** : Prix dans la zone d'entree, le trade est "en cours"
-- **TRIGGERED** : TP1 atteint (considere comme un succes)
+- **TP1_HIT** : TP1 atteint, tracking continue vers TP2
+- **TP2_HIT** : TP2 atteint, tracking continue vers TP3
+- **TP3_HIT** : TP3 atteint, scenario completement reussi
 - **INVALIDATED** : SL touche ou prix trop loin
 - **EXPIRED** : 30 minutes ecoulees sans activation
 
-**Limites :**
-- Maximum **5 scenarios actifs** simultanement
-- Si un 6e est cree avec un meilleur score, il remplace le plus faible
-- Les scenarios expires/invalides sont nettoyes apres 60 secondes
+### Trailing Stop Loss
+
+Apres chaque TP atteint, le SL est remonte pour proteger les gains :
+- Apres TP1 → SL deplace au **breakeven** (milieu de la zone d'entree)
+- Apres TP2 → SL deplace au **TP1**
+
+### Non-expiration haute priorite
+
+Les scenarios avec `adjustedScore >= 40` ne sont **jamais expires** automatiquement. Ils restent actifs jusqu'a TP ou SL.
+
+### MFE / MAE Tracking
+
+Pour chaque scenario actif, le systeme traque en continu :
+- **MFE** (Max Favorable Excursion) : meilleur prix atteint dans la bonne direction
+- **MAE** (Max Adverse Excursion) : pire prix atteint dans la mauvaise direction
+
+Permet d'analyser apres coup si les SL sont trop serres ou les TP trop ambitieux.
+
+### Limites
+
+- Maximum **3 scenarios actifs** simultanement
+- Si un 4e est cree avec un meilleur score, il remplace le plus faible
+- Les scenarios termines (INVALIDATED/EXPIRED/TP3_HIT) sont nettoyes apres 60 secondes
+- **Deduplication double :**
+  1. Meme template + direction + statut actif + < 2 min = skip
+  2. Cross-template : si 50%+ d'overlap de zone d'entree avec un scenario existant dans la meme direction → skip (ou remplacement si meilleur score)
 
 ---
 
-## 7. Faiblesses Identifiees (pourquoi le winrate est mauvais)
-
-### 7.1 Pas de filtre de tendance
-Le moteur de confluence est **independant** du Trend Analyzer. Un scenario LONG peut etre genere en plein DOWNTREND, et inversement. Il n'y a aucune penalite pour les trades contre-tendance.
-
-**Impact :** Beaucoup de scenarios sont generes a contre-courant du marche.
-
-### 7.2 TP/SL purement mecaniques
-Les niveaux TP sont des multiples fixes du risque (1.5x, 2.5x, 4x). Ils ne tiennent **pas compte** de :
-- Niveaux de structure (supports/resistances)
-- Zones de liquidite
-- Order blocks proches
-- Points of Control (POC)
-
-**Impact :** Les TP sont souvent dans des zones ou le prix n'a aucune raison d'aller.
-
-### 7.3 Zone d'entree trop etroite
-La zone d'entree est bornee a **+/- 0.1%** du prix minimum/maximum des signaux. Pour BTC a $87K, ca fait ~$174 de zone. Combine avec le SL buffer de 0.1%, le risque est tres petit, ce qui rend les TP tres proches.
-
-**Impact :** Le scenario passe de PENDING a ACTIVE puis INVALIDATED tres vite, sans laisser le trade respirer.
-
-### 7.4 Pas de tracking TP2/TP3
-Une fois TP1 atteint, le scenario passe a TRIGGERED et c'est fini. Il n'y a pas :
-- De tracking des TP2/TP3
-- De trailing stop
-- De gestion partielle des positions
-
-**Impact :** Impossible de savoir si les scenarios auraient atteint des objectifs plus ambitieux.
-
-### 7.5 Le champ `strength` est ignore
-Chaque signal peut porter une force (0 a 1) mais elle n'est **jamais utilisee** dans le calcul du score. Un signal ABSORPTION faible (noise) compte autant qu'un signal ABSORPTION fort (vrai mur).
-
-**Impact :** Des signaux faibles/bruyants contribuent autant que des signaux forts, generant des faux positifs.
-
-### 7.6 Deduplication = un seul OI dans le score
-Tous les signaux OI (OI_SURGE, OI_FLUSH, OI_DIVERGENCE) sont regroupes dans la meme categorie de poids. Meme si tu as 3 alertes OI differentes, ca ne compte que pour **8 points**.
-
-### 7.7 Penalite contra trop faible
-Un signal dans la direction opposee ne deduit que **30%** de son poids. Un ORDER_BLOCK (SHORT) dans un scenario LONG ne retire que 6 points sur les 20 qu'il "vaut". Ca ne dissuade pas assez les scenarios conflictuels.
-
-### 7.8 Fenetre de 5 minutes pour les signaux
-Les signaux de plus de 5 minutes sont supprimes. C'est tres court — un order block identifie il y a 6 minutes est ignore meme s'il est encore valide structurellement.
-
-### 7.9 Templates 5/6 ne verifient pas le signe du funding
-Le Short Squeeze (template 5) devrait exiger un funding **negatif** (trop de shorts). Le Long Squeeze (template 6) devrait exiger un funding **positif** (trop de longs). Actuellement, seule la direction du scenario est verifiee, pas le signe du funding.
-
-### 7.10 Pas d'integration entre trend et scenario
-Le Trend Analyzer calcule un score composite de -100 a +100 (6 facteurs : momentum prix, CVD, carnet d'ordres, biais signaux, momentum volume, pression liquidations). Mais ce score n'est **jamais injecte** dans le moteur de confluence. Les deux systemes vivent en parallele.
-
----
-
-## 8. Le Trend Analyzer (systeme parallele)
+## 7. Le Trend Analyzer
 
 Score composite de **-100 a +100** base sur 6 facteurs :
 
 | Facteur | Poids | Ce qu'il mesure |
 |---------|-------|-----------------|
-| Price Momentum | 25% | EMA(8) vs EMA(21) |
-| CVD Trend | 25% | Pression achat/vente cumulative |
-| Order Book | 15% | Ratio bids vs asks |
-| Signal Bias | 15% | Ratio signaux bull vs bear |
+| Price Momentum | 25% | EMA(8) vs EMA(21) sur samples de prix 1s |
+| CVD Trend | 25% | Pression achat/vente cumulative (recent vs ancien) |
+| Order Book | 15% | Ratio bids vs asks (smoothing EMA 0.1) |
+| Signal Bias | 15% | Ratio signaux bull vs bear (30 dernieres alertes) |
 | Volume Momentum | 10% | Acceleration volume * direction prix |
-| Liquidation Pressure | 10% | Liquidations shorts vs longs |
+| Liquidation Pressure | 10% | Liquidations shorts vs longs (5 min, seuil $10K) |
 
 **Resultat :** `BULL` (score > 15), `BEAR` (score < -15), `NEUTRAL` (entre -15 et +15)
 
-Ce score est affiche dans l'UI (barre du haut) mais **n'influence pas** la generation de scenarios.
+Le trend est integre dans le scoring des scenarios via le **multiplicateur de tendance** (section 3.5).
 
 ---
 
-## 9. Pistes d'Amelioration
+## 8. Persistence et Logging
 
-1. **Integrer le trend dans le score** : ajouter un facteur "trend alignment" (+15 si scenario aligne avec la tendance, -15 si contre)
-2. **Utiliser le champ strength** : ponderer le poids des signaux par leur force (poids * strength)
-3. **TP bases sur la structure** : utiliser les niveaux de structure (previous highs/lows, OBs, liquidite) comme TP au lieu de multiples fixes
-4. **Elargir la zone d'entree** : augmenter le buffer a 0.3-0.5% pour laisser le trade respirer
-5. **Augmenter la fenetre signaux** : passer de 5 a 15 minutes pour les signaux de structure (OB, FVG, BOS)
-6. **Tracker TP2/TP3** : continuer le suivi apres TP1 pour mesurer le vrai potentiel
-7. **Penalite contra plus forte** : passer de 30% a 60-80% pour decourager les scenarios conflictuels
-8. **Verifier le signe du funding** dans les templates squeeze
-9. **Minimum de signaux "forts"** : exiger au moins 1 signal de poids >= 15 (structure, OB, sweep) pour valider un scenario
+### Scenarios actifs
+- Sauvegardes toutes les 30 secondes dans `./data/active_scenarios.json`
+- Restaures au redemarrage du serveur (les scenarios PENDING/ACTIVE reprennent)
+
+### Historique des outcomes
+- Chaque scenario termine est logge dans `./data/scenario_outcomes.jsonl` (append-only)
+- Champs : id, template, direction, scores, prix, statut final, duree, MFE, MAE
+- Accessible dans l'UI via le Trade Journal (onglet Tools)
+- Endpoint REST : `GET /api/trade-history`
+
+---
+
+## 9. Mapping Directionnel (alertes → signaux confluence)
+
+| Type alerte | Direction LONG | Direction SHORT |
+|-------------|---------------|----------------|
+| ABSORPTION | dominantSide = SELL (absorption des ventes) | dominantSide = BUY |
+| SPIKE | message contient 'Buy' | message contient 'Sell' |
+| VELOCITY | message contient 'Buy' | message contient 'Sell' |
+| EXHAUSTION | message 'Bullish' (prix baisse, vendeurs epuises) | message 'Bearish' (prix monte, acheteurs epuises) |
+| DIVERGENCE | message 'Bullish' | message 'Bearish' |
+| TWAP | message 'buying' | message 'selling' |
+| LIQUIDATION | liquidations SHORT (short squeeze) | liquidations LONG |
+| FUNDING_EXTREME | rate < 0 (shorts paient) | rate > 0 (longs paient) |
+| BASIS_EXTREME | basis < 0 | basis > 0 |
+| OI | OI+/prix+ ou OI-/prix+ | OI+/prix- ou OI-/prix- |
+| BOS/CHoCH | direction BULLISH | direction BEARISH |
+| ORDER_BLOCK | type BULLISH | type BEARISH |
+| FVG | type BULLISH | type BEARISH |
+| LIQUIDITY_SWEEP | SELLSIDE sweep | BUYSIDE sweep |
+| VWAP_POSITION | prix <= lowerBand2 | prix >= upperBand2 |
+| VOLUME_PROFILE | prix < POC | prix > POC |
+
+---
+
+## 10. Constantes Configurables (SCENARIO_CONFIG)
+
+```
+// Trend & scoring
+TREND_ALIGNED_MAX_BOOST    = 0.25    // +25% max si trend aligne
+TREND_COUNTER_MAX_PENALTY  = 0.40    // -40% max si contre-tendance
+TREND_HARD_BLOCK_THRESHOLD = 60      // |trendScore| au-dessus = blocage total counter-trend
+TREND_SOFT_BLOCK_THRESHOLD = 30      // |trendScore| au-dessus = rawScore minimum requis
+COUNTER_TREND_MIN_RAW_SCORE= 50      // rawScore minimum pour counter-trend en tendance moderee
+MIN_STRENGTH_FLOOR         = 0.3     // signal ne peut valoir < 30% de son poids
+CONTRA_PENALTY_HIGH        = 0.70    // penalite contra pour poids >= 15
+CONTRA_PENALTY_MEDIUM      = 0.50    // penalite contra pour poids >= 8
+CONTRA_PENALTY_LOW         = 0.30    // penalite contra pour poids < 8
+DECAY_RATE                 = 0.7     // vitesse de decay temporel
+TF_MULTIPLIERS             = { 1m: 0.6, 5m: 1.0, 15m: 1.4, 1h: 1.6 }
+PROXIMITY_MAX_DISTANCE     = 0.01    // 1% max de distance
+CLUSTER_WINDOW_MS          = 30000   // 30 secondes pour le clustering
+CLUSTER_BONUS_HIGH         = 10      // 3+ paires
+CLUSTER_BONUS_LOW          = 5       // 1-2 paires
+MINIMUM_ANCHOR_WEIGHT      = 15      // poids min pour un signal "fort" (OB, SWEEP, STRUCTURE)
+TRAILING_SL_ENABLED        = true
+
+// Entry & TP/SL
+minScoreForScenario        = 40      // seuil minimum (ancien: 30)
+maxActiveScenarios         = 3       // slots simultanees (ancien: 5)
+minRiskReward              = 1.5     // R:R minimum sur TP2
+ENTRY_BUFFER_PCT           = 0.15%   // zone d'entree (ancien: 0.3%)
+SL_MODE                    = 'ATR'   // mode SL adaptatif
+ATR_SL_MULTIPLIER          = 1.0     // 1x ATR comme buffer SL
+MIN_SL_BUFFER_PCT          = 0.1%    // plancher SL
+TP1_MULTIPLIER             = 1.0     // (ancien: 1.5)
+TP2_MULTIPLIER             = 2.0     // (ancien: 2.5)
+TP3_MULTIPLIER             = 3.5     // (ancien: 4.0)
+scenarioExpirationMs       = 30 min
+
+// Dedup & cooldown
+DEDUP_OVERLAP_THRESHOLD    = 0.5     // 50% overlap = meme trade
+SL_COOLDOWN_MS             = 300000  // 5 min cooldown apres SL
+SL_COOLDOWN_OVERRIDE_SCORE = 55      // score HIGH bypass le cooldown
+```

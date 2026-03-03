@@ -329,6 +329,12 @@ export function startEngine(
       const candles = candleBuilder.getCandles(tf);
       const breaks = analyzer.onCandleClose(candles);
 
+      // Update confluence engine with ATR from 1m structure (most responsive)
+      if (tf === '1m') {
+        const atr = analyzer.getATR();
+        if (atr > 0) confluenceEngine.updateATR(atr);
+      }
+
       // FVG detection
       const fvgDetector = fvgDetectors.get(tf);
       if (fvgDetector) {
@@ -977,7 +983,7 @@ export function startEngine(
         } else if (alertType === 'VELOCITY') {
           dir = (alert as any).message?.includes('Buy') ? 'LONG' : 'SHORT';
         } else if (alertType === 'EXHAUSTION') {
-          dir = 'LONG';
+          dir = (alert as any).message?.includes('Bullish') ? 'LONG' : 'SHORT';
         } else if (alertType === 'DIVERGENCE') {
           dir = (alert as any).message?.includes('Bullish') ? 'LONG' : 'SHORT';
         } else if (alertType === 'TWAP') {
@@ -1288,5 +1294,5 @@ export function startEngine(
   console.log(`[ENGINE] Phase A active: Structure analysis (${[...structureAnalyzers.keys()].join(', ')}) + VWAP`);
   console.log(`[ENGINE] Phase B active: Order Blocks, FVGs, Liquidity, Volume Profile`);
   console.log(`[ENGINE] Phase C active: Open Interest, Funding Rate, Basis/Premium`);
-  console.log(`[ENGINE] Phase D active: Confluence Engine (10 templates, max ${confluenceEngine.getActiveScenarios().length}/${conflConfig.maxActiveScenarios ?? 5} scenarios)`);
+  console.log(`[ENGINE] Phase D active: Confluence Engine (10 templates, max ${confluenceEngine.getActiveScenarios().length}/${conflConfig.maxActiveScenarios ?? 3} scenarios)`);
 }

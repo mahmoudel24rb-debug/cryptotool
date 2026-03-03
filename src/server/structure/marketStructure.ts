@@ -83,7 +83,7 @@ export class MarketStructureAnalyzer {
       // CHoCH BEARISH: close below last swing low (reversal)
       if (lastSL && currentCandle.close < lastSL.price && !lastSL.broken) {
         const bodySize = Math.abs(currentCandle.close - currentCandle.open);
-        const atr = this.getCurrentATR();
+        const atr = this.getATR();
         // Validate displacement: body must be > minDisplacementATR * ATR
         if (atr > 0 && bodySize > this.config.minDisplacementATR * atr) {
           const brk = this.createBreak('CHoCH', 'BEARISH', lastSL, currentCandle);
@@ -107,7 +107,7 @@ export class MarketStructureAnalyzer {
       // CHoCH BULLISH: close above last swing high (reversal)
       if (lastSH && currentCandle.close > lastSH.price && !lastSH.broken) {
         const bodySize = Math.abs(currentCandle.close - currentCandle.open);
-        const atr = this.getCurrentATR();
+        const atr = this.getATR();
         if (atr > 0 && bodySize > this.config.minDisplacementATR * atr) {
           const brk = this.createBreak('CHoCH', 'BULLISH', lastSH, currentCandle);
           breaks.push(brk);
@@ -185,7 +185,7 @@ export class MarketStructureAnalyzer {
         }
         if (lastSL && currentCandle.close < lastSL.price && !lastSL.broken) {
           const bodySize = Math.abs(currentCandle.close - currentCandle.open);
-          const atr = this.getCurrentATR();
+          const atr = this.getATR();
           if (atr > 0 && bodySize > this.config.minDisplacementATR * atr) {
             const brk = this.createBreak('CHoCH', 'BEARISH', lastSL, currentCandle);
             this.recentBreaks.unshift(brk);
@@ -205,7 +205,7 @@ export class MarketStructureAnalyzer {
         }
         if (lastSH && currentCandle.close > lastSH.price && !lastSH.broken) {
           const bodySize = Math.abs(currentCandle.close - currentCandle.open);
-          const atr = this.getCurrentATR();
+          const atr = this.getATR();
           if (atr > 0 && bodySize > this.config.minDisplacementATR * atr) {
             const brk = this.createBreak('CHoCH', 'BULLISH', lastSH, currentCandle);
             this.recentBreaks.unshift(brk);
@@ -313,7 +313,7 @@ export class MarketStructureAnalyzer {
     }
   }
 
-  private getCurrentATR(): number {
+  getATR(): number {
     const period = this.config.atrPeriod;
     if (this.atrValues.length < period) {
       if (this.atrValues.length === 0) return 0;

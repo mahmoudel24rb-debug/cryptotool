@@ -85,10 +85,10 @@ const TEMPLATES: ScenarioTemplate[] = [
   {
     id: 10,
     name: 'Multi-Exchange Divergence',
-    description: 'Divergence prix/CVD entre exchanges — suivre le leader',
-    requiredSignals: ['DIVERGENCE'],
+    description: 'Divergence prix/CVD entre exchanges — confirmée par absorption ou structure',
+    requiredSignals: ['DIVERGENCE', 'ABSORPTION', 'STRUCTURE'],
     bonusSignals: ['BASIS_EXTREME', 'SPIKE', 'VELOCITY'],
-    minRequiredCount: 1,
+    minRequiredCount: 2,
   },
 ];
 
