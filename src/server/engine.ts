@@ -228,14 +228,14 @@ export function startEngine(
   const conflConfig = config.confluence || {};
   const confluenceEngine = new ConfluenceEngine({
     weights: conflConfig.weights || undefined,
-    minScoreForScenario: conflConfig.minScoreForScenario ?? 30,
-    highPriorityThreshold: conflConfig.highPriorityThreshold ?? 55,
+    minScoreForScenario: conflConfig.minScoreForScenario ?? 40,
+    highPriorityThreshold: conflConfig.highPriorityThreshold ?? 60,
     extremePriorityThreshold: conflConfig.extremePriorityThreshold ?? 75,
     signalTimeWindowMs: conflConfig.signalTimeWindowMs ?? 300000,
     scenarioExpirationMs: conflConfig.scenarioExpirationMs ?? 1800000,
-    maxActiveScenarios: conflConfig.maxActiveScenarios ?? 5,
+    maxActiveScenarios: conflConfig.maxActiveScenarios ?? 3,
     minRiskReward: conflConfig.minRiskReward ?? 1.5,
-    slBufferPercent: conflConfig.slBufferPercent ?? 0.2,
+    slBufferPercent: conflConfig.slBufferPercent ?? 0.15,
   });
 
   // Phase 1.1: Inject TrendAnalyzer into ConfluenceEngine
