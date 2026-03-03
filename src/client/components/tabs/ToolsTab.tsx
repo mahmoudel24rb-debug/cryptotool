@@ -363,8 +363,8 @@ function TradeJournal() {
             <span style={{ textAlign: 'right' }}>{t.exitPrice ? `$${t.exitPrice.toFixed(0)}` : '—'}</span>
             <span style={{ textAlign: 'center', color: statusColor(t), fontWeight: 700 }}>{statusLabel(t)}</span>
             <span style={{ textAlign: 'center', color: '#6b7280' }}>{fmtDuration(t.durationMs)}</span>
-            <span style={{ textAlign: 'right', color: '#22c55e' }}>${t.maxFavorableExcursion.toFixed(0)}</span>
-            <span style={{ textAlign: 'right', color: '#ef4444' }}>${t.maxAdverseExcursion.toFixed(0)}</span>
+            <span style={{ textAlign: 'right', color: '#22c55e' }}>{t.maxFavorableExcursion != null ? `$${t.maxFavorableExcursion.toFixed(0)}` : '—'}</span>
+            <span style={{ textAlign: 'right', color: '#ef4444' }}>{t.maxAdverseExcursion != null ? `$${t.maxAdverseExcursion.toFixed(0)}` : '—'}</span>
           </div>
         ))}
       </div>
