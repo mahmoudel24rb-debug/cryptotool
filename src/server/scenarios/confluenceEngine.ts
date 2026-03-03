@@ -623,7 +623,8 @@ export class ConfluenceEngine {
 
       // Expiration only for PENDING and ACTIVE (TP-hit scenarios keep tracking)
       // High-score scenarios (40+) never expire — they stay until SL or TP
-      if ((sc.status === 'PENDING' || sc.status === 'ACTIVE') && now >= sc.expiresAt && sc.adjustedScore < 40) {
+      const adjScore = sc.meta?.adjustedScore ?? sc.score;
+      if ((sc.status === 'PENDING' || sc.status === 'ACTIVE') && now >= sc.expiresAt && adjScore < 40) {
         sc.status = 'EXPIRED';
         sc.exitTime = now;
         sc.exitReason = 'Expired';
@@ -876,7 +877,8 @@ export class ConfluenceEngine {
       for (const sc of data.scenarios) {
         // Skip if already expired (expiresAt passed while server was down)
         // High-score scenarios (40+) never expire
-        if ((sc.status === 'PENDING' || sc.status === 'ACTIVE') && sc.expiresAt && now >= sc.expiresAt && sc.adjustedScore < 40) {
+        const adjScore = sc.meta?.adjustedScore ?? sc.score;
+        if ((sc.status === 'PENDING' || sc.status === 'ACTIVE') && sc.expiresAt && now >= sc.expiresAt && adjScore < 40) {
           // Log as expired outcome
           sc.status = 'EXPIRED';
           sc.exitTime = sc.expiresAt;
