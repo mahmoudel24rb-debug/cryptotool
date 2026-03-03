@@ -207,132 +207,166 @@ function Screener({ state }: { state: any }) {
   );
 }
 
-// ── Trade Journal ──
-interface TradeEntry {
+// ── Trade Journal (fetches from /api/trade-history on mount) ──
+interface ScenarioOutcome {
   id: string;
-  date: string;
+  template: string;
   direction: 'LONG' | 'SHORT';
-  entry: number;
-  exit: number | null;
-  size: string;
-  pnl: number | null;
-  rr: number | null;
-  notes: string;
+  createdAt: number;
+  adjustedScore: number;
+  priority: string;
+  signalCount: number;
+  signalTypes: string[];
+  entryMid: number;
+  sl: number;
+  tp1: number;
+  finalStatus: string;
+  exitPrice: number | null;
+  exitTime: number;
+  exitReason: string;
+  durationMs: number;
+  maxFavorableExcursion: number;
+  maxAdverseExcursion: number;
+  tp1Hit: boolean;
+  tp2Hit: boolean;
+  tp3Hit: boolean;
+  timeframe: string;
 }
 
+const mono = "'JetBrains Mono', monospace";
+
 function TradeJournal() {
-  const [trades, setTrades] = useState<TradeEntry[]>([]);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [trades, setTrades] = useState<ScenarioOutcome[]>([]);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    fetch('/api/trade-history')
+      .then(r => r.json())
+      .then((data: ScenarioOutcome[]) => {
+        setTrades(data.reverse()); // newest first
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
+  }, []);
 
-    const dpr = window.devicePixelRatio || 1;
-    const rect = canvas.getBoundingClientRect();
-    canvas.width = rect.width * dpr;
-    canvas.height = rect.height * dpr;
-    ctx.scale(dpr, dpr);
-    const W = rect.width;
-    const H = rect.height;
-
-    ctx.fillStyle = '#0a0e14';
-    ctx.fillRect(0, 0, W, H);
-
-    const pad = 24;
-    let y = 20;
-
-    ctx.fillStyle = '#ffd700';
-    ctx.font = 'bold 14px monospace';
-    ctx.textAlign = 'left';
-    ctx.fillText('TRADE JOURNAL', pad, y + 12);
-    y += 32;
-
-    if (trades.length === 0) {
-      ctx.fillStyle = '#4b5563';
-      ctx.font = '11px monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText('No trades logged yet.', W / 2, y + 40);
-      ctx.fillText('Click + NEW TRADE to start tracking your trades.', W / 2, y + 58);
-      return;
-    }
-
-    // Headers
-    const cx = [pad, 100, 160, 260, 360, 430, 500];
-    const headers = ['DATE', 'DIR', 'ENTRY', 'EXIT', 'P&L', 'R:R', 'NOTES'];
-    ctx.fillStyle = '#6b7280'; ctx.font = 'bold 9px monospace'; ctx.textAlign = 'left';
-    for (let i = 0; i < headers.length; i++) ctx.fillText(headers[i], cx[i], y + 10);
-    y += 16;
-    ctx.strokeStyle = '#1e293b'; ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(W - pad, y); ctx.stroke();
-    y += 8;
-
-    for (const t of trades) {
-      ctx.font = '10px monospace'; ctx.textAlign = 'left';
-      ctx.fillStyle = '#9ca3af'; ctx.fillText(t.date, cx[0], y + 12);
-      ctx.fillStyle = t.direction === 'LONG' ? '#22c55e' : '#ef4444'; ctx.font = 'bold 10px monospace'; ctx.fillText(t.direction, cx[1], y + 12);
-      ctx.fillStyle = '#e5e7eb'; ctx.font = '10px monospace';
-      ctx.fillText(`$${t.entry.toFixed(0)}`, cx[2], y + 12);
-      ctx.fillText(t.exit ? `$${t.exit.toFixed(0)}` : '—', cx[3], y + 12);
-      if (t.pnl !== null) { ctx.fillStyle = t.pnl >= 0 ? '#22c55e' : '#ef4444'; ctx.fillText(`${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(0)}`, cx[4], y + 12); }
-      if (t.rr !== null) { ctx.fillStyle = t.rr >= 0 ? '#22c55e' : '#ef4444'; ctx.fillText(`${t.rr.toFixed(1)}R`, cx[5], y + 12); }
-      ctx.fillStyle = '#6b7280'; ctx.fillText(t.notes.slice(0, 25), cx[6], y + 12);
-      y += 24;
-    }
-
-    y += 16;
-    const wins = trades.filter(t => t.pnl !== null && t.pnl > 0).length;
-    const total = trades.filter(t => t.pnl !== null).length;
-    const wr = total > 0 ? ((wins / total) * 100).toFixed(1) : '—';
-    ctx.fillStyle = '#6b7280'; ctx.font = '9px monospace'; ctx.textAlign = 'left';
-    ctx.fillText(`STATS: ${trades.length} trades | Winrate: ${wr}%`, pad, y + 10);
+  const stats = React.useMemo(() => {
+    const total = trades.length;
+    const slHits = trades.filter(t => t.finalStatus === 'INVALIDATED').length;
+    const tp1 = trades.filter(t => t.tp1Hit).length;
+    const tp2 = trades.filter(t => t.tp2Hit).length;
+    const tp3 = trades.filter(t => t.tp3Hit).length;
+    const expired = trades.filter(t => t.finalStatus === 'EXPIRED').length;
+    const winrate = total > 0 ? ((tp1 / total) * 100).toFixed(1) : '0';
+    return { total, slHits, tp1, tp2, tp3, expired, winrate };
   }, [trades]);
 
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const parent = canvas.parentElement;
-    if (!parent) return;
-    const ro = new ResizeObserver(() => { const r = parent.getBoundingClientRect(); canvas.style.width = `${r.width}px`; canvas.style.height = `${r.height}px`; });
-    ro.observe(parent);
-    return () => ro.disconnect();
-  }, []);
+  const statusColor = (t: ScenarioOutcome) => {
+    if (t.tp3Hit) return '#22c55e';
+    if (t.tp2Hit) return '#22c55e';
+    if (t.tp1Hit) return '#86efac';
+    if (t.finalStatus === 'EXPIRED') return '#6b7280';
+    return '#ef4444';
+  };
+
+  const statusLabel = (t: ScenarioOutcome) => {
+    if (t.tp3Hit) return 'TP3';
+    if (t.tp2Hit) return 'TP2';
+    if (t.tp1Hit) return 'TP1';
+    if (t.finalStatus === 'EXPIRED') return 'EXP';
+    return 'SL';
+  };
+
+  const fmtDuration = (ms: number) => {
+    const m = Math.floor(ms / 60000);
+    return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${m % 60}m`;
+  };
+
+  const fmtDate = (ts: number) => {
+    const d = new Date(ts);
+    return d.toLocaleDateString('fr-FR', { day: '2-digit', month: 'short' }) + ' ' +
+      d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+  };
+
+  if (loading) {
+    return <div style={{ padding: 40, color: '#6b7280', fontFamily: mono, fontSize: 12, textAlign: 'center' }}>Chargement...</div>;
+  }
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', background: '#0a0e14' }}>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '8px 24px', borderBottom: '1px solid #1a1a2e', flexShrink: 0 }}>
+      {/* Stats bar */}
+      <div style={{
+        display: 'flex', gap: 20, padding: '10px 20px', borderBottom: '1px solid #1a1a2e',
+        fontFamily: mono, fontSize: 10, color: '#9ca3af', flexShrink: 0,
+      }}>
+        <span style={{ color: '#ffd700', fontWeight: 700 }}>TRADE JOURNAL</span>
+        <span>{stats.total} trades</span>
+        <span>WR: <span style={{ color: parseFloat(stats.winrate) >= 50 ? '#22c55e' : '#ef4444' }}>{stats.winrate}%</span></span>
+        <span style={{ color: '#22c55e' }}>TP1: {stats.tp1}</span>
+        <span style={{ color: '#22c55e' }}>TP2: {stats.tp2}</span>
+        <span style={{ color: '#22c55e' }}>TP3: {stats.tp3}</span>
+        <span style={{ color: '#ef4444' }}>SL: {stats.slHits}</span>
+        <span style={{ color: '#6b7280' }}>EXP: {stats.expired}</span>
         <button
           onClick={() => {
-            setTrades(prev => [...prev, {
-              id: Date.now().toString(),
-              date: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-              direction: Math.random() > 0.5 ? 'LONG' : 'SHORT',
-              entry: 85000 + Math.random() * 2000,
-              exit: 85000 + Math.random() * 3000,
-              size: '0.1 BTC',
-              pnl: (Math.random() - 0.4) * 200,
-              rr: (Math.random() - 0.3) * 4,
-              notes: 'Manual entry',
-            }]);
+            setLoading(true);
+            fetch('/api/trade-history')
+              .then(r => r.json())
+              .then((data: ScenarioOutcome[]) => { setTrades(data.reverse()); setLoading(false); })
+              .catch(() => setLoading(false));
           }}
           style={{
-            padding: '6px 16px',
-            background: '#ffd70022',
-            border: '1px solid #ffd70044',
-            color: '#ffd700',
-            fontSize: 10,
-            fontWeight: 700,
-            cursor: 'pointer',
-            fontFamily: "'JetBrains Mono', monospace",
-            borderRadius: 2,
+            marginLeft: 'auto', padding: '2px 10px', background: '#1e293b', border: '1px solid #334155',
+            color: '#9ca3af', fontSize: 9, cursor: 'pointer', fontFamily: mono, borderRadius: 2,
           }}
-        >
-          + NEW TRADE
-        </button>
+        >REFRESH</button>
       </div>
-      <div style={{ flex: 1, minHeight: 0 }}>
-        <canvas ref={canvasRef} style={{ width: '100%', height: '100%', display: 'block' }} />
+
+      {/* Table header */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: '110px 50px 55px 180px 75px 75px 50px 55px 75px 75px',
+        padding: '6px 20px', borderBottom: '1px solid #1e293b',
+        fontFamily: mono, fontSize: 9, fontWeight: 700, color: '#6b7280', flexShrink: 0,
+      }}>
+        <span>DATE</span><span>DIR</span><span>SCORE</span><span>TEMPLATE</span>
+        <span style={{ textAlign: 'right' }}>ENTRY</span>
+        <span style={{ textAlign: 'right' }}>EXIT</span>
+        <span style={{ textAlign: 'center' }}>RESULT</span>
+        <span style={{ textAlign: 'center' }}>DUREE</span>
+        <span style={{ textAlign: 'right' }}>MFE</span>
+        <span style={{ textAlign: 'right' }}>MAE</span>
+      </div>
+
+      {/* Trade rows */}
+      <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
+        {trades.length === 0 ? (
+          <div style={{ padding: 40, color: '#4b5563', fontFamily: mono, fontSize: 11, textAlign: 'center' }}>
+            Aucun scenario terminé enregistré.
+          </div>
+        ) : trades.map(t => (
+          <div
+            key={t.id}
+            style={{
+              display: 'grid',
+              gridTemplateColumns: '110px 50px 55px 180px 75px 75px 50px 55px 75px 75px',
+              padding: '5px 20px',
+              borderBottom: '1px solid #111827',
+              fontFamily: mono, fontSize: 10, color: '#d1d5db',
+              alignItems: 'center',
+            }}
+          >
+            <span style={{ color: '#9ca3af' }}>{fmtDate(t.createdAt)}</span>
+            <span style={{ color: t.direction === 'LONG' ? '#22c55e' : '#ef4444', fontWeight: 700 }}>{t.direction}</span>
+            <span style={{ color: t.adjustedScore >= 40 ? '#ffd700' : '#9ca3af' }}>{t.adjustedScore}</span>
+            <span style={{ color: '#8b9dc3', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.template}</span>
+            <span style={{ textAlign: 'right' }}>${t.entryMid.toFixed(0)}</span>
+            <span style={{ textAlign: 'right' }}>{t.exitPrice ? `$${t.exitPrice.toFixed(0)}` : '—'}</span>
+            <span style={{ textAlign: 'center', color: statusColor(t), fontWeight: 700 }}>{statusLabel(t)}</span>
+            <span style={{ textAlign: 'center', color: '#6b7280' }}>{fmtDuration(t.durationMs)}</span>
+            <span style={{ textAlign: 'right', color: '#22c55e' }}>${t.maxFavorableExcursion.toFixed(0)}</span>
+            <span style={{ textAlign: 'right', color: '#ef4444' }}>${t.maxAdverseExcursion.toFixed(0)}</span>
+          </div>
+        ))}
       </div>
     </div>
   );

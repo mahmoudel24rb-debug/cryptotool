@@ -80,6 +80,19 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
 
+// Trade history — read scenario outcomes log (one-time fetch, no WS)
+app.get('/api/trade-history', (_req, res) => {
+  const logPath = path.resolve(__dirname, '../../data/scenario_outcomes.jsonl');
+  if (!fs.existsSync(logPath)) return res.json([]);
+  try {
+    const lines = fs.readFileSync(logPath, 'utf-8').trim().split('\n').filter(Boolean);
+    const trades = lines.map(line => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
+    res.json(trades);
+  } catch {
+    res.json([]);
+  }
+});
+
 // Serve static frontend in production
 if (process.env.NODE_ENV === 'production') {
   // Prefer dist/client/ (built assets), fallback to ../client (compiled tsc layout)
