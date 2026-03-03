@@ -100,11 +100,45 @@ export class MackuantDatafeed {
       this.lastBarCount = currentCount;
     }
 
-    // Normal real-time tick updates — only compute for the active subscriber's last bar
+    // Real-time tick updates — detect gaps and send missing bars
     for (const [guid, sub] of this.subscribers) {
       const bars = this.getBarsForSymbol(sub.symbolName, sub.resolution);
       if (bars.length === 0) continue;
+
+      const prevBar = this.lastBarBySubscriber.get(guid);
       const lastBar = bars[bars.length - 1];
+
+      // Detect gap: if last sent bar is >1 period behind, we missed candles
+      if (prevBar) {
+        const tfSec = (RESOLUTION_MAP[sub.resolution] || 60) * 1000;
+        const timeDiff = lastBar.time * 1000 - prevBar.time;
+        if (timeDiff > tfSec * 2) {
+          // Gap detected — send all missed bars then reset
+          // Find the first bar after the last sent one
+          const startIdx = bars.findIndex(b => b.time * 1000 > prevBar.time);
+          if (startIdx >= 0) {
+            for (let i = startIdx; i < bars.length; i++) {
+              const b = bars[i];
+              const tvBar = {
+                time: b.time * 1000,
+                open: b.open, high: b.high,
+                low: b.low, close: b.close,
+                volume: b.volume,
+              };
+              sub.onTick(tvBar);
+            }
+            this.lastBarBySubscriber.set(guid, {
+              time: lastBar.time * 1000,
+              open: lastBar.open, high: lastBar.high,
+              low: lastBar.low, close: lastBar.close,
+              volume: lastBar.volume,
+            });
+            continue;
+          }
+        }
+      }
+
+      // Normal update: send last bar
       const tvBar = {
         time: lastBar.time * 1000,
         open: lastBar.open,
@@ -113,7 +147,6 @@ export class MackuantDatafeed {
         close: lastBar.close,
         volume: lastBar.volume,
       };
-      const prevBar = this.lastBarBySubscriber.get(guid);
       if (!prevBar || prevBar.time !== tvBar.time ||
           prevBar.close !== tvBar.close || prevBar.high !== tvBar.high ||
           prevBar.low !== tvBar.low || prevBar.volume !== tvBar.volume) {
