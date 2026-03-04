@@ -133,7 +133,7 @@ export default function App() {
   }, [subscribe]);
 
   // Header price: use same priority as Chart.tsx to avoid exchange mismatch
-  const PRICE_PRIORITY_KEYS = ['BINANCE_FUTURES:PERP', 'BYBIT:PERP', 'BINANCE:SPOT', 'OKX:PERP', 'COINBASE:SPOT', 'HYPERLIQUID:PERP'];
+  const PRICE_PRIORITY_KEYS = ['BYBIT:PERP', 'BINANCE_FUTURES:PERP', 'BINANCE:SPOT', 'OKX:PERP', 'COINBASE:SPOT', 'HYPERLIQUID:PERP'];
 
   // Candle ticks (every 500ms — mutate in place, throttle React to 2/sec)
   // Server may send Candle or Candle[] (when minute just changed, [prev, current])

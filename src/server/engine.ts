@@ -1167,7 +1167,7 @@ export function startEngine(
       const secondLatest = arr.length > 1 ? arr[arr.length - 2] : null;
 
       const lastSent = lastBroadcastedCandleTime.get(key);
-      if (secondLatest && lastSent !== undefined && lastSent < secondLatest.time) {
+      if (secondLatest && lastSent !== undefined && latest.time > lastSent) {
         // Minute changed: send [closed candle, current candle]
         payload[key] = [secondLatest, latest];
       } else {

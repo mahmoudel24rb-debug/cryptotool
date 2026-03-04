@@ -77,11 +77,11 @@ interface ChartProps {
 }
 
 const PRIMARY_KEYS = [
+  'BYBIT:PERP',
   'BINANCE_FUTURES:PERP',
   'BINANCE:SPOT',
-  'BYBIT:PERP',
-  'COINBASE:SPOT',
   'OKX:PERP',
+  'COINBASE:SPOT',
   'HYPERLIQUID:PERP',
 ];
 
