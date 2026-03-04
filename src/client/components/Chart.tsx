@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useMemo } from 'react';
+import React, { useEffect, useRef, useMemo, useState, useCallback } from 'react';
 import { MackuantDatafeed, type CandleDataStore } from '../datafeed/mackuantDatafeed';
 import { useGlobalState } from '../hooks/useGlobalState';
 
@@ -84,6 +84,16 @@ const PRIMARY_KEYS = [
   'COINBASE:SPOT',
   'HYPERLIQUID:PERP',
 ];
+
+// Short display labels for exchange buttons
+const EXCHANGE_LABELS: Record<string, string> = {
+  'BYBIT:PERP': 'Bybit',
+  'BINANCE_FUTURES:PERP': 'Binance F',
+  'BINANCE:SPOT': 'Binance S',
+  'OKX:PERP': 'OKX',
+  'COINBASE:SPOT': 'Coinbase',
+  'HYPERLIQUID:PERP': 'Hyperliquid',
+};
 
 declare global {
   interface Window {
@@ -172,28 +182,57 @@ export default function Chart({
   const structureRef = useRef(structureData);
   const overlayTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const drawingRef = useRef(false); // mutex to prevent concurrent draws
-  const primaryKeyRef = useRef<string | null>(null);
+
+  // Exchange selector state
+  const [selectedExchange, setSelectedExchange] = useState<string | null>(null);
+  const activeSymbolRef = useRef<string | null>(null);
 
   // Keep refs in sync
   vwapRef.current = vwapData;
   structureRef.current = structureData;
 
-  // Find primary exchange key — stabilize to prevent widget recreation (Bug #9)
-  const primaryKey = useMemo(() => {
-    const available = Object.keys(candlesByExchange);
-    // If current key is still available, keep it (stability)
-    if (primaryKeyRef.current && candlesByExchange[primaryKeyRef.current]?.length > 0) {
-      return primaryKeyRef.current;
-    }
-    const newKey = PRIMARY_KEYS.find(k => available.includes(k) && candlesByExchange[k]?.length > 0)
-      ?? available[0] ?? null;
-    primaryKeyRef.current = newKey;
-    return newKey;
+  // Available exchanges (those with candle data)
+  const availableExchanges = useMemo(() => {
+    const available = Object.keys(candlesByExchange).filter(k => candlesByExchange[k]?.length > 0);
+    // Sort by PRIMARY_KEYS order
+    return PRIMARY_KEYS.filter(k => available.includes(k));
   }, [candlesByExchange]);
+
+  // Effective exchange: user selection or auto-pick
+  const effectiveExchange = useMemo(() => {
+    if (selectedExchange && candlesByExchange[selectedExchange]?.length > 0) {
+      return selectedExchange;
+    }
+    return availableExchanges[0] ?? null;
+  }, [selectedExchange, availableExchanges, candlesByExchange]);
+
+  // Initial exchange for widget creation (stable — only set once)
+  const initialExchangeRef = useRef<string | null>(null);
+  if (!initialExchangeRef.current && effectiveExchange) {
+    initialExchangeRef.current = effectiveExchange;
+  }
+
+  // Switch symbol on the existing widget when exchange changes (no widget recreation)
+  const switchSymbol = useCallback((newSymbol: string) => {
+    if (!widgetRef.current || !readyRef.current) return;
+    if (activeSymbolRef.current === newSymbol) return;
+    try {
+      widgetRef.current.activeChart().setSymbol(newSymbol);
+      activeSymbolRef.current = newSymbol;
+    } catch (_) { /* ignore */ }
+  }, []);
+
+  // When effectiveExchange changes, switch symbol (not recreate widget)
+  useEffect(() => {
+    if (effectiveExchange && effectiveExchange !== activeSymbolRef.current) {
+      switchSymbol(effectiveExchange);
+    }
+  }, [effectiveExchange, switchSymbol]);
 
   // ── Initialize TradingView widget once ──
   useEffect(() => {
-    if (!containerRef.current || !primaryKey) return;
+    const initSymbol = initialExchangeRef.current;
+    if (!containerRef.current || !initSymbol) return;
     if (!window.TradingView) {
       console.error('TradingView library not loaded');
       return;
@@ -210,7 +249,7 @@ export default function Chart({
     const widget = new window.TradingView.widget({
       container: containerRef.current,
       datafeed: datafeed as any,
-      symbol: primaryKey,
+      symbol: initSymbol,
       interval: '1' as any,
       library_path: '/charting_library/',
       locale: 'en',
@@ -265,12 +304,18 @@ export default function Chart({
     });
 
     widgetRef.current = widget;
+    activeSymbolRef.current = initSymbol;
 
     widget.onChartReady(() => {
       readyRef.current = true;
 
       // Add volume as overlay on main pane (forceOverlay = true)
       widget.activeChart().createStudy('Volume', true, false);
+
+      // If effectiveExchange changed while widget was loading, switch now
+      if (effectiveExchange && effectiveExchange !== initSymbol) {
+        switchSymbol(effectiveExchange);
+      }
 
       // Draw initial overlays after a short delay, then refresh every 15s
       setTimeout(() => drawAllOverlays(), 1500);
@@ -285,9 +330,10 @@ export default function Chart({
         widgetRef.current = null;
       }
       datafeedRef.current = null;
+      activeSymbolRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [primaryKey]);
+  }, [initialExchangeRef.current]);
 
   // ── Push real-time candle updates to datafeed ──
   // Uses candleStoreRef (mutable, always fresh) + candleTickVersion as trigger
@@ -413,6 +459,7 @@ export default function Chart({
 
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+      {/* Title */}
       {title && (
         <div style={{
           position: 'absolute',
@@ -425,6 +472,40 @@ export default function Chart({
           {title}
         </div>
       )}
+
+      {/* Exchange selector buttons */}
+      {availableExchanges.length > 1 && (
+        <div style={{
+          position: 'absolute',
+          top: 4, right: 8, zIndex: 10,
+          display: 'flex',
+          gap: 3,
+        }}>
+          {availableExchanges.map(key => {
+            const isActive = effectiveExchange === key;
+            return (
+              <button
+                key={key}
+                onClick={() => setSelectedExchange(key)}
+                style={{
+                  padding: '2px 8px',
+                  fontSize: 10,
+                  fontFamily: '"JetBrains Mono", monospace',
+                  background: isActive ? '#1e3a5f' : '#1a1a2e',
+                  color: isActive ? '#60a5fa' : '#787b86',
+                  border: `1px solid ${isActive ? '#60a5fa' : '#2a2a3e'}`,
+                  borderRadius: 3,
+                  cursor: 'pointer',
+                  transition: 'all 0.15s',
+                }}
+              >
+                {EXCHANGE_LABELS[key] || key.split(':')[0]}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
     </div>
   );
