@@ -228,7 +228,7 @@ export function startEngine(
   const conflConfig = config.confluence || {};
   const confluenceEngine = new ConfluenceEngine({
     weights: conflConfig.weights || undefined,
-    minScoreForScenario: conflConfig.minScoreForScenario ?? 40,
+    minScoreForScenario: conflConfig.minScoreForScenario ?? 35,
     highPriorityThreshold: conflConfig.highPriorityThreshold ?? 60,
     extremePriorityThreshold: conflConfig.extremePriorityThreshold ?? 75,
     signalTimeWindowMs: conflConfig.signalTimeWindowMs ?? 300000,

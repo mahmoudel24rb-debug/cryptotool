@@ -32,9 +32,9 @@ export const SCENARIO_CONFIG = {
   TRAILING_SL_ENABLED: true,
 
   // Phase 3.1 — Scoring avancé
-  DECAY_RATE: 0.7,
+  DECAY_RATE: 0.5,
   TF_MULTIPLIERS: { '1m': 0.6, '5m': 1.0, '15m': 1.4, '1h': 1.6 } as Record<string, number>,
-  PROXIMITY_MAX_DISTANCE: 0.01,      // 1% max distance for proximity factor
+  PROXIMITY_MAX_DISTANCE: 0.025,     // 2.5% max distance for proximity factor
 
   // Phase 3.2 — Clustering temporel
   CLUSTER_WINDOW_MS: 30_000,         // 30 secondes
@@ -46,8 +46,8 @@ export const SCENARIO_CONFIG = {
 
   // Counter-trend blocking
   TREND_HARD_BLOCK_THRESHOLD: 60,    // |trendScore| above → block ALL counter-trend
-  TREND_SOFT_BLOCK_THRESHOLD: 30,    // |trendScore| above → require high rawScore for counter-trend
-  COUNTER_TREND_MIN_RAW_SCORE: 50,   // minimum rawScore for counter-trend in moderate trend
+  TREND_SOFT_BLOCK_THRESHOLD: 45,    // |trendScore| above → require high rawScore for counter-trend
+  COUNTER_TREND_MIN_RAW_SCORE: 45,   // minimum rawScore for counter-trend in moderate trend
 
   // Cross-template deduplication
   DEDUP_OVERLAP_THRESHOLD: 0.5,      // 50% entry zone overlap = same trade
@@ -124,7 +124,7 @@ const DEFAULT_CONFIG: ConfluenceConfig = {
     vwapPosition: 5,
     volumeProfile: 5,
   },
-  minScoreForScenario: 40,
+  minScoreForScenario: 35,
   highPriorityThreshold: 60,
   extremePriorityThreshold: 75,
   signalTimeWindowMs: 300000,       // fallback, overridden by per-signal TTL
@@ -276,10 +276,25 @@ export class ConfluenceEngine {
     this.evaluate();
   }
 
+  private lastDiagnosticLog = 0;
+  private evalStats = { calls: 0, noAnchor: 0, lowScore: 0, counterBlocked: 0, noTemplate: 0, duplicate: 0, lowRR: 0, emitted: 0 };
+
   /** Periodic tick — check expirations and lifecycle */
   tick(): void {
     this.pruneOldSignals();
     this.updateScenarioLifecycle();
+
+    // Diagnostic log every 5 minutes
+    const now = Date.now();
+    if (now - this.lastDiagnosticLog >= 300_000) {
+      this.lastDiagnosticLog = now;
+      const signalTypes = new Map<string, number>();
+      for (const s of this.signals) signalTypes.set(s.type, (signalTypes.get(s.type) || 0) + 1);
+      const typeSummary = Array.from(signalTypes.entries()).map(([t, n]) => `${t}:${n}`).join(', ');
+      const trendInfo = this.trendProvider ? this.trendProvider.analyze() : { score: 0, trend: 'N/A' };
+      console.log(`[CONFLUENCE] signals=${this.signals.length} [${typeSummary}] | price=$${this.currentPrice.toFixed(0)} atr=${this.currentATR.toFixed(1)} | trend=${trendInfo.trend}(${trendInfo.score}) | active=${this.getActiveScenarios().length} | eval: ${this.evalStats.calls} calls, noAnchor=${this.evalStats.noAnchor} lowScore=${this.evalStats.lowScore} counterBlock=${this.evalStats.counterBlocked} noTemplate=${this.evalStats.noTemplate} dup=${this.evalStats.duplicate} lowRR=${this.evalStats.lowRR} emitted=${this.evalStats.emitted}`);
+      this.evalStats = { calls: 0, noAnchor: 0, lowScore: 0, counterBlocked: 0, noTemplate: 0, duplicate: 0, lowRR: 0, emitted: 0 };
+    }
   }
 
   getActiveScenarios(): TradeScenario[] {
@@ -308,6 +323,7 @@ export class ConfluenceEngine {
 
   private evaluate(): void {
     if (this.currentPrice <= 0) return;
+    this.evalStats.calls++;
 
     // Group signals by price zone (within 0.3% of each other)
     const zones = this.groupSignalsByZone();
@@ -318,7 +334,7 @@ export class ConfluenceEngine {
       if (!direction) continue;
 
       // Phase 3.3: Require at least one anchor signal (weight >= 10)
-      if (!hasAnchorSignal(zone, direction, this.config.weights)) continue;
+      if (!hasAnchorSignal(zone, direction, this.config.weights)) { this.evalStats.noAnchor++; continue; }
 
       // Calculate score (Phase 1.2 strength + Phase 1.5 contra + Phase 3.1 decay/proximity)
       const { score: rawScore, maxScore, contributions } = this.calculateScore(zone, direction);
@@ -337,12 +353,12 @@ export class ConfluenceEngine {
       if (isCounter) {
         const absTrend = Math.abs(trendScore);
         // Hard block: strong trend → no counter-trend at all
-        if (absTrend > SCENARIO_CONFIG.TREND_HARD_BLOCK_THRESHOLD) continue;
+        if (absTrend > SCENARIO_CONFIG.TREND_HARD_BLOCK_THRESHOLD) { this.evalStats.counterBlocked++; continue; }
         // Soft block: moderate trend → require high raw confluence
-        if (absTrend > SCENARIO_CONFIG.TREND_SOFT_BLOCK_THRESHOLD && rawScore < SCENARIO_CONFIG.COUNTER_TREND_MIN_RAW_SCORE) continue;
+        if (absTrend > SCENARIO_CONFIG.TREND_SOFT_BLOCK_THRESHOLD && rawScore < SCENARIO_CONFIG.COUNTER_TREND_MIN_RAW_SCORE) { this.evalStats.counterBlocked++; continue; }
       }
 
-      if (adjustedScore < this.config.minScoreForScenario) continue;
+      if (adjustedScore < this.config.minScoreForScenario) { this.evalStats.lowScore++; continue; }
 
       // SL cooldown check (TIER 3.2)
       const timeSinceLastSL = Date.now() - (this.lastSLTimestamp[direction] || 0);
@@ -350,10 +366,10 @@ export class ConfluenceEngine {
 
       // Try to match a template
       const template = matchTemplate(zone, direction, contributions);
-      if (!template) continue;
+      if (!template) { this.evalStats.noTemplate++; continue; }
 
       // Check if we already have a similar scenario (same template)
-      if (this.isDuplicate(template, direction)) continue;
+      if (this.isDuplicate(template, direction)) { this.evalStats.duplicate++; continue; }
 
       // Build the scenario
       const scenario = this.buildScenario(
@@ -375,7 +391,7 @@ export class ConfluenceEngine {
       };
 
       // Check R:R
-      if (scenario.riskReward < this.config.minRiskReward) continue;
+      if (scenario.riskReward < this.config.minRiskReward) { this.evalStats.lowRR++; continue; }
 
       // Check max active
       const active = this.getActiveScenarios();
@@ -391,6 +407,7 @@ export class ConfluenceEngine {
       }
 
       this.activeScenarios.push(scenario);
+      this.evalStats.emitted++;
       console.log(`[SCENARIO] NEW ${scenario.direction} "${scenario.templateName}" | raw=${rawScore} trend=${trendScore} mult=${trendMultiplier.toFixed(2)} adj=${adjustedScore} cluster=${clusterBonus} | R:R=${scenario.riskReward} | signals: ${contributions.map(c => c.name).join(', ')}`);
       this.emit('scenario:new', scenario);
     }
