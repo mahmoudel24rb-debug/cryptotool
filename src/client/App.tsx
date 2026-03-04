@@ -41,6 +41,8 @@ export default function App() {
   const [derivativesData, setDerivativesData] = useState<any>(null);
   const [scenarios, setScenarios] = useState<any[]>([]);
   const [htfCandles, setHtfCandles] = useState<Record<string, Record<string, any[]>>>({});
+  const [candleTickVersion, setCandleTickVersion] = useState(0);
+  const candleTickVersionRef = useRef(0);
 
   // Mutable stores for high-frequency data (avoid array copies on every tick)
   const candleStoreRef = useRef<Record<string, any[]>>({});
@@ -130,39 +132,53 @@ export default function App() {
     return unsub;
   }, [subscribe]);
 
+  // Header price: use same priority as Chart.tsx to avoid exchange mismatch
+  const PRICE_PRIORITY_KEYS = ['BINANCE_FUTURES:PERP', 'BYBIT:PERP', 'BINANCE:SPOT', 'OKX:PERP', 'COINBASE:SPOT', 'HYPERLIQUID:PERP'];
+
   // Candle ticks (every 500ms — mutate in place, throttle React to 2/sec)
+  // Server may send Candle or Candle[] (when minute just changed, [prev, current])
   useEffect(() => {
     const unsub = subscribe('candle_tick', (msg) => {
       const ticks = msg.data as Record<string, any>;
       const store = candleStoreRef.current;
 
-      for (const [key, candle] of Object.entries(ticks)) {
+      for (const [key, payload] of Object.entries(ticks)) {
         const arr = store[key];
         if (!arr || arr.length === 0) {
-          store[key] = [candle];
+          store[key] = Array.isArray(payload) ? payload : [payload];
           continue;
         }
-        const last = arr[arr.length - 1];
-        if (last.time === (candle as any).time) {
-          arr[arr.length - 1] = candle; // in-place update, zero copy
-        } else if ((candle as any).time > last.time) {
-          arr.push(candle); // in-place push, zero copy
-          // Prune oldest candles to prevent unbounded memory growth
-          if (arr.length > 5000) arr.splice(0, arr.length - 4500);
+
+        // Normalize: always process an array
+        const candles = Array.isArray(payload) ? payload : [payload];
+        for (const candle of candles) {
+          const last = arr[arr.length - 1];
+          if (!last) { arr.push(candle); continue; }
+          if (candle.time === last.time) {
+            arr[arr.length - 1] = candle; // in-place update
+          } else if (candle.time > last.time) {
+            arr.push(candle); // new minute
+          }
         }
+
+        // Prune oldest candles to prevent unbounded memory growth
+        if (arr.length > 5000) arr.splice(0, arr.length - 4500);
       }
 
-      // Track current price
-      const firstKey = Object.keys(store)[0];
-      if (firstKey && store[firstKey]?.length > 0) {
-        setCurrentPrice(store[firstKey][store[firstKey].length - 1].close ?? 0);
+      // Track current price — use same priority as Chart.tsx (Bug #5)
+      const priceKey = PRICE_PRIORITY_KEYS.find(k => store[k]?.length > 0)
+        ?? Object.keys(store)[0];
+      if (priceKey && store[priceKey]?.length > 0) {
+        setCurrentPrice(store[priceKey][store[priceKey].length - 1].close ?? 0);
       }
 
       // Throttle React state sync to max 2x per second
+      candleTickVersionRef.current++;
       const now = Date.now();
       if (now - candleSyncRef.current >= 500) {
         candleSyncRef.current = now;
         setCandlesByExchange({ ...store });
+        setCandleTickVersion(candleTickVersionRef.current);
       }
     });
     return unsub;
@@ -324,6 +340,7 @@ export default function App() {
     unreadAlerts,
     lastSpike,
     htfCandles,
+    candleTickVersion,
   };
 
   const globalActions: GlobalActions = {
@@ -336,7 +353,7 @@ export default function App() {
     incrementUnread,
   };
 
-  const ctxValue: GlobalContextValue = { state: globalState, actions: globalActions };
+  const ctxValue: GlobalContextValue = { state: globalState, actions: globalActions, candleStoreRef };
 
   return (
     <GlobalContext.Provider value={ctxValue}>

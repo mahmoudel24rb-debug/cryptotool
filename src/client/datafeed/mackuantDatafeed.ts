@@ -58,8 +58,7 @@ export interface CandleDataStore {
 // Cache entry for pre-computed bars
 interface BarCache {
   bars: Candle[];
-  sourceLength: number;  // length of source array when cache was built
-  lastTime: number;      // time of last candle when cache was built
+  cacheKey: string;  // composite key: "length:firstTime:lastTime"
 }
 
 export class MackuantDatafeed {
@@ -108,24 +107,32 @@ export class MackuantDatafeed {
       const prevBar = this.lastBarBySubscriber.get(guid);
       const lastBar = bars[bars.length - 1];
 
-      // Detect gap: if last sent bar is >1 period behind, we missed candles
+      // Detect gap: if last sent bar is >=1 period behind, we missed candles
       if (prevBar) {
-        const tfSec = (RESOLUTION_MAP[sub.resolution] || 60) * 1000;
+        const tfMs = (RESOLUTION_MAP[sub.resolution] || 60) * 1000;
         const timeDiff = lastBar.time * 1000 - prevBar.time;
-        if (timeDiff > tfSec * 2) {
-          // Gap detected — send all missed bars then reset
-          // Find the first bar after the last sent one
-          const startIdx = bars.findIndex(b => b.time * 1000 > prevBar.time);
-          if (startIdx >= 0) {
+        if (timeDiff >= tfMs * 2) {
+          // Gap detected — binary search for the first bar after prevBar
+          const targetTime = prevBar.time / 1000; // convert to seconds
+          let lo = 0, hi = bars.length - 1, startIdx = bars.length;
+          while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (bars[mid].time > targetTime) {
+              startIdx = mid;
+              hi = mid - 1;
+            } else {
+              lo = mid + 1;
+            }
+          }
+          if (startIdx < bars.length) {
             for (let i = startIdx; i < bars.length; i++) {
               const b = bars[i];
-              const tvBar = {
+              sub.onTick({
                 time: b.time * 1000,
                 open: b.open, high: b.high,
                 low: b.low, close: b.close,
                 volume: b.volume,
-              };
-              sub.onTick(tvBar);
+              });
             }
             this.lastBarBySubscriber.set(guid, {
               time: lastBar.time * 1000,
@@ -173,13 +180,14 @@ export class MackuantDatafeed {
     const rawCandles = this.store.candlesByExchange[symbolName];
     if (!rawCandles || rawCandles.length === 0) return [];
 
-    // Check cache — invalidate only when source data changed
-    const cacheKey = `${symbolName}:${resolution}`;
-    const cached = this.barCache.get(cacheKey);
+    // Check cache — invalidate when source data changed (composite key: length + first + last time)
+    const mapKey = `${symbolName}:${resolution}`;
+    const cached = this.barCache.get(mapKey);
     const lastCandle = rawCandles[rawCandles.length - 1];
-    if (cached &&
-        cached.sourceLength === rawCandles.length &&
-        cached.lastTime === lastCandle.time) {
+    const firstCandle = rawCandles[0];
+    const compositeKey = `${rawCandles.length}:${firstCandle?.time ?? 0}:${lastCandle.time}`;
+
+    if (cached && cached.cacheKey === compositeKey) {
       // Update the last bar in cache in-place (price may have changed)
       if (cached.bars.length > 0) {
         const lastCached = cached.bars[cached.bars.length - 1];
@@ -207,10 +215,9 @@ export class MackuantDatafeed {
       bars = aggregateCandles(rawCandles, tfSec);
     }
 
-    this.barCache.set(cacheKey, {
+    this.barCache.set(mapKey, {
       bars,
-      sourceLength: rawCandles.length,
-      lastTime: lastCandle.time,
+      cacheKey: compositeKey,
     });
 
     return bars;

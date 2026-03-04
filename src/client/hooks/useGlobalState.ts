@@ -48,6 +48,9 @@ export interface GlobalState {
 
   // Higher timeframe candles (1h, 4h) — keyed by tf then exchange
   htfCandles: Record<string, Record<string, any[]>>;
+
+  // Incremented on every candle_tick to signal Chart refresh (bypasses React throttle)
+  candleTickVersion: number;
 }
 
 export interface GlobalActions {
@@ -74,6 +77,8 @@ export interface GlobalActions {
 export interface GlobalContextValue {
   state: GlobalState;
   actions: GlobalActions;
+  /** Mutable ref to the live candle store (always up-to-date, bypasses React throttle) */
+  candleStoreRef?: React.RefObject<Record<string, any[]>>;
 }
 
 export const GlobalContext = createContext<GlobalContextValue | null>(null);

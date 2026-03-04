@@ -1,5 +1,6 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useMemo } from 'react';
 import { MackuantDatafeed, type CandleDataStore } from '../datafeed/mackuantDatafeed';
+import { useGlobalState } from '../hooks/useGlobalState';
 
 // ── Types ──
 
@@ -161,6 +162,7 @@ export default function Chart({
   vwapData,
   structureData,
 }: ChartProps) {
+  const { state, candleStoreRef } = useGlobalState();
   const containerRef = useRef<HTMLDivElement>(null);
   const widgetRef = useRef<any>(null);
   const datafeedRef = useRef<MackuantDatafeed | null>(null);
@@ -170,15 +172,24 @@ export default function Chart({
   const structureRef = useRef(structureData);
   const overlayTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const drawingRef = useRef(false); // mutex to prevent concurrent draws
+  const primaryKeyRef = useRef<string | null>(null);
 
   // Keep refs in sync
   vwapRef.current = vwapData;
   structureRef.current = structureData;
 
-  // Find primary exchange key
-  const primaryKey = PRIMARY_KEYS.find(k => candlesByExchange[k]?.length > 0)
-    || Object.keys(candlesByExchange)[0]
-    || null;
+  // Find primary exchange key — stabilize to prevent widget recreation (Bug #9)
+  const primaryKey = useMemo(() => {
+    const available = Object.keys(candlesByExchange);
+    // If current key is still available, keep it (stability)
+    if (primaryKeyRef.current && candlesByExchange[primaryKeyRef.current]?.length > 0) {
+      return primaryKeyRef.current;
+    }
+    const newKey = PRIMARY_KEYS.find(k => available.includes(k) && candlesByExchange[k]?.length > 0)
+      ?? available[0] ?? null;
+    primaryKeyRef.current = newKey;
+    return newKey;
+  }, [candlesByExchange]);
 
   // ── Initialize TradingView widget once ──
   useEffect(() => {
@@ -279,14 +290,17 @@ export default function Chart({
   }, [primaryKey]);
 
   // ── Push real-time candle updates to datafeed ──
+  // Uses candleStoreRef (mutable, always fresh) + candleTickVersion as trigger
   useEffect(() => {
     if (!datafeedRef.current) return;
+    const liveStore = candleStoreRef?.current ?? candlesByExchange;
     datafeedRef.current.updateStore({
-      candlesByExchange,
+      candlesByExchange: liveStore,
       htfCandles: htfCandles || {},
     });
     datafeedRef.current.onRealtimeUpdate();
-  }, [candlesByExchange, htfCandles]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.candleTickVersion, htfCandles]);
 
   // ── Draw all overlays (async-safe with mutex) ──
   async function drawAllOverlays() {

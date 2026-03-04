@@ -590,6 +590,7 @@ export function startEngine(
 
   // Store candles per exchange key — keep last 4500 candles (~3 days of 1m)
   const candlesByExchange = new Map<string, Map<number, Candle>>();
+  const sortedCandleArrays = new Map<string, Candle[]>(); // parallel sorted arrays (avoid sort on broadcast)
   const MAX_CANDLES = 4500;
 
   // ── Paginated Binance candle fetcher (up to `pages` x 1500 = 4500 candles) ──
@@ -640,6 +641,7 @@ export function startEngine(
     );
     if (binanceFutures.size > 0) {
       candlesByExchange.set('BINANCE_FUTURES:PERP', binanceFutures);
+      sortedCandleArrays.set('BINANCE_FUTURES:PERP', Array.from(binanceFutures.values()).sort((a, b) => a.time - b.time));
       console.log(`[CANDLES] Loaded ${binanceFutures.size} historical candles for BINANCE_FUTURES:PERP`);
     }
 
@@ -649,6 +651,7 @@ export function startEngine(
     );
     if (binanceSpot.size > 0) {
       candlesByExchange.set('BINANCE:SPOT', binanceSpot);
+      sortedCandleArrays.set('BINANCE:SPOT', Array.from(binanceSpot.values()).sort((a, b) => a.time - b.time));
       console.log(`[CANDLES] Loaded ${binanceSpot.size} historical candles for BINANCE:SPOT`);
     }
 
@@ -708,6 +711,7 @@ export function startEngine(
 
         if (candles.size > 0) {
           candlesByExchange.set(src.key, candles);
+          sortedCandleArrays.set(src.key, Array.from(candles.values()).sort((a, b) => a.time - b.time));
           console.log(`[CANDLES] Loaded ${candles.size} historical candles for ${src.key}`);
         }
       } catch (err: any) {
@@ -719,9 +723,9 @@ export function startEngine(
   // Fetch history and seed Phase A modules
   fetchHistoricalCandles().then(() => {
     // Seed the multi-TF candle builder with historical 1m data from Binance Futures
-    const binanceFuturesCandles = candlesByExchange.get('BINANCE_FUTURES:PERP');
-    if (binanceFuturesCandles && binanceFuturesCandles.size > 0) {
-      const sorted = Array.from(binanceFuturesCandles.values()).sort((a, b) => a.time - b.time);
+    const binanceFuturesArr = sortedCandleArrays.get('BINANCE_FUTURES:PERP');
+    if (binanceFuturesArr && binanceFuturesArr.length > 0) {
+      const sorted = binanceFuturesArr; // already sorted
       // Convert to CandleBuilder format (add missing fields with defaults)
       const enriched: CandleBuilderCandle[] = sorted.map(c => ({
         time: c.time,
@@ -787,8 +791,10 @@ export function startEngine(
     const key = `${trade.exchange}:${trade.market}`;
     if (!candlesByExchange.has(key)) {
       candlesByExchange.set(key, new Map());
+      sortedCandleArrays.set(key, []);
     }
     const candles = candlesByExchange.get(key)!;
+    const sortedArr = sortedCandleArrays.get(key)!;
     const minuteTs = Math.floor(trade.timestamp / 60000) * 60; // seconds
 
     let candle = candles.get(minuteTs);
@@ -802,15 +808,15 @@ export function startEngine(
         volume: trade.usdValue,
       };
       candles.set(minuteTs, candle);
+      sortedArr.push(candle); // O(1) — trades arrive chronologically
 
       // Prune old candles
-      if (candles.size > MAX_CANDLES) {
-        const keys = Array.from(candles.keys()).sort((a, b) => a - b);
-        for (let i = 0; i < keys.length - MAX_CANDLES; i++) {
-          candles.delete(keys[i]);
-        }
+      if (sortedArr.length > MAX_CANDLES) {
+        const removed = sortedArr.splice(0, sortedArr.length - MAX_CANDLES);
+        for (const r of removed) candles.delete(r.time);
       }
     } else {
+      // In-place update — same object referenced by both Map and array
       candle.high = Math.max(candle.high, trade.price);
       candle.low = Math.min(candle.low, trade.price);
       candle.close = trade.price;
@@ -891,10 +897,15 @@ export function startEngine(
     perfMaxBatchMs = 0;
   }, 10000);
 
-  // Process batched trades every 100ms
-  setInterval(() => {
-    if (tradeBatch.length === 0) return;
+  // Process batched trades every 100ms — chunked async to yield event loop during big moves
+  const CHUNK_SIZE = 200;
+  let drainInProgress = false;
 
+  setInterval(async () => {
+    if (tradeBatch.length === 0 || drainInProgress) return;
+    drainInProgress = true;
+
+    try {
     const batchStart = Date.now();
 
     // Drain the batch
@@ -903,28 +914,35 @@ export function startEngine(
     perfBatchCount++;
     if (batch.length > perfMaxBatchSize) perfMaxBatchSize = batch.length;
 
-    // Fast path: update candles, CVD, buffer for ALL trades (cheap per-trade ops)
-    for (const trade of batch) {
-      updateCandle(trade);
-      updateHTFCandle(trade);
-      updateCvd(trade);
-      tradeBuffer.push(trade);
-      metrics.onTrade(trade);
+    // Process in chunks to yield event loop between them
+    for (let i = 0; i < batch.length; i += CHUNK_SIZE) {
+      const chunk = batch.slice(i, i + CHUNK_SIZE);
+
+      for (const trade of chunk) {
+        updateCandle(trade);
+        updateHTFCandle(trade);
+        updateCvd(trade);
+        tradeBuffer.push(trade);
+        metrics.onTrade(trade);
+      }
+
+      for (const trade of chunk) {
+        candleBuilder.onTrade(trade);
+      }
+
+      for (const trade of chunk) {
+        vwapCalculator.onTrade(trade);
+        volumeProfile.onTrade(trade);
+      }
+
+      // Yield to event loop between chunks so broadcasts can run
+      if (i + CHUNK_SIZE < batch.length) {
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
     }
 
     // Use the LAST trade as representative for per-batch operations
     const lastTrade = batch[batch.length - 1];
-
-    // CandleBuilder: feed all trades to build proper OHLCV
-    for (const trade of batch) {
-      candleBuilder.onTrade(trade);
-    }
-
-    // VWAP & Volume Profile: feed all trades (merged into single loop)
-    for (const trade of batch) {
-      vwapCalculator.onTrade(trade);
-      volumeProfile.onTrade(trade);
-    }
 
     const batchMs = Date.now() - batchStart;
     if (batchMs > perfMaxBatchMs) perfMaxBatchMs = batchMs;
@@ -1000,6 +1018,9 @@ export function startEngine(
           details: { description: (alert as any).message || alertType },
         });
       }
+    }
+    } finally {
+      drainInProgress = false;
     }
   }, BATCH_INTERVAL_MS);
 
@@ -1089,11 +1110,11 @@ export function startEngine(
   // Fetch HTF candles at startup (after 1m candles are loaded)
   fetchHTFHistoricalCandles();
 
-  // ── Helper: build full candle payload ──
+  // ── Helper: build full candle payload (uses pre-sorted arrays — no sort needed) ──
   function buildFullCandlePayload(): Record<string, Candle[]> {
     const payload: Record<string, Candle[]> = {};
-    for (const [key, candles] of candlesByExchange) {
-      payload[key] = Array.from(candles.values()).sort((a, b) => a.time - b.time);
+    for (const [key, arr] of sortedCandleArrays) {
+      payload[key] = arr;
     }
     return payload;
   }
@@ -1133,15 +1154,26 @@ export function startEngine(
     broadcast('cvd', getCvdSeries());
   }, 30000);
 
-  // Broadcast only the CURRENT candle + CVD tip every 500ms (reduced from 100ms)
+  // Track last broadcasted candle time per exchange (for detecting minute transitions)
+  const lastBroadcastedCandleTime = new Map<string, number>();
+
+  // Broadcast CURRENT candle (+ previous if minute just changed) + CVD tip every 500ms
   setInterval(() => {
-    const payload: Record<string, Candle> = {};
-    for (const [key, candles] of candlesByExchange) {
-      let latest: Candle | null = null;
-      for (const c of candles.values()) {
-        if (!latest || c.time > latest.time) latest = c;
+    const payload: Record<string, Candle | Candle[]> = {};
+    for (const [key, arr] of sortedCandleArrays) {
+      if (arr.length === 0) continue;
+      // O(1) access to last two candles from sorted array
+      const latest = arr[arr.length - 1];
+      const secondLatest = arr.length > 1 ? arr[arr.length - 2] : null;
+
+      const lastSent = lastBroadcastedCandleTime.get(key);
+      if (secondLatest && lastSent !== undefined && lastSent < secondLatest.time) {
+        // Minute changed: send [closed candle, current candle]
+        payload[key] = [secondLatest, latest];
+      } else {
+        payload[key] = latest;
       }
-      if (latest) payload[key] = latest;
+      lastBroadcastedCandleTime.set(key, latest.time);
     }
     broadcast('candle_tick', payload);
 
