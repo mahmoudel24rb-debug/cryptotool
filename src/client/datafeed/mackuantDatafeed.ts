@@ -66,7 +66,7 @@ export class MackuantDatafeed {
   private subscribers = new Map<string, Subscriber>();
   private lastBarBySubscriber = new Map<string, any>();
   private initialDataLoaded = false;
-  private lastBarCount = 0;
+  private lastBarCountBySymbol = new Map<string, number>();
 
   // Cache: "symbol:resolution" → pre-computed sorted bar array
   private barCache = new Map<string, BarCache>();
@@ -84,31 +84,30 @@ export class MackuantDatafeed {
   resetForSymbolSwitch() {
     this.barCache.clear();
     this.lastBarBySubscriber.clear();
+    this.lastBarCountBySymbol.clear();
     this.initialDataLoaded = false;
-    this.lastBarCount = 0;
   }
 
   /** Called externally on each candle update to push real-time updates */
   onRealtimeUpdate() {
-    // Detect when full history arrives (big jump in bar count)
-    // and reset cache so TradingView re-requests all data
-    const pk = this.getPrimaryKey();
-    if (pk) {
-      const currentCount = this.store.candlesByExchange[pk]?.length || 0;
-      if (!this.initialDataLoaded && this.lastBarCount < 100 && currentCount >= 100) {
+    // CHART-FIX-2+3: Detect full history arrival PER SUBSCRIBER, no early return
+    const resetGuids = new Set<string>();
+    for (const [guid, sub] of this.subscribers) {
+      const currentCount = this.store.candlesByExchange[sub.symbolName]?.length || 0;
+      const lastCount = this.lastBarCountBySymbol.get(sub.symbolName) || 0;
+
+      if (!this.initialDataLoaded && lastCount < 100 && currentCount >= 100) {
         this.initialDataLoaded = true;
-        this.barCache.clear(); // Invalidate all caches
-        for (const [, sub] of this.subscribers) {
-          sub.onResetCache();
-        }
-        this.lastBarCount = currentCount;
-        return;
+        this.barCache.clear();
+        sub.onResetCache();
+        resetGuids.add(guid);
       }
-      this.lastBarCount = currentCount;
+      this.lastBarCountBySymbol.set(sub.symbolName, currentCount);
     }
 
     // Real-time tick updates — detect gaps and send missing bars
     for (const [guid, sub] of this.subscribers) {
+      if (resetGuids.has(guid)) continue; // skip subscribers that just got reset
       const bars = this.getBarsForSymbol(sub.symbolName, sub.resolution);
       if (bars.length === 0) continue;
 
@@ -188,28 +187,19 @@ export class MackuantDatafeed {
     const rawCandles = this.store.candlesByExchange[symbolName];
     if (!rawCandles || rawCandles.length === 0) return [];
 
-    // Check cache — invalidate when source data changed (composite key: length + first + last time)
     const mapKey = `${symbolName}:${resolution}`;
     const cached = this.barCache.get(mapKey);
     const lastCandle = rawCandles[rawCandles.length - 1];
     const firstCandle = rawCandles[0];
-    const compositeKey = `${rawCandles.length}:${firstCandle?.time ?? 0}:${lastCandle.time}`;
+
+    // CHART-FIX-4: Extended key includes price data to invalidate on any change
+    const compositeKey = `${rawCandles.length}:${firstCandle?.time ?? 0}:${lastCandle.time}:${lastCandle.close}:${lastCandle.high}:${lastCandle.low}`;
 
     if (cached && cached.cacheKey === compositeKey) {
-      // Update the last bar in cache in-place (price may have changed)
-      if (cached.bars.length > 0) {
-        const lastCached = cached.bars[cached.bars.length - 1];
-        const lastBucketTime = Math.floor(lastCandle.time / tfSec) * tfSec;
-        if (lastCached.time === lastBucketTime) {
-          lastCached.high = Math.max(lastCached.high, lastCandle.high);
-          lastCached.low = Math.min(lastCached.low, lastCandle.low);
-          lastCached.close = lastCandle.close;
-        }
-      }
       return cached.bars;
     }
 
-    // Compute and cache
+    // Recompute
     let bars: Candle[];
     const tfLabel = tfSec === 3600 ? '1h' : tfSec === 14400 ? '4h' : null;
     if (tfLabel && this.store.htfCandles[tfLabel]?.[symbolName]?.length > 0) {
@@ -223,11 +213,7 @@ export class MackuantDatafeed {
       bars = aggregateCandles(rawCandles, tfSec);
     }
 
-    this.barCache.set(mapKey, {
-      bars,
-      cacheKey: compositeKey,
-    });
-
+    this.barCache.set(mapKey, { bars, cacheKey: compositeKey });
     return bars;
   }
 

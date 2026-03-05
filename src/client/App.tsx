@@ -128,6 +128,10 @@ export default function App() {
       const data = msg.data as Record<string, any[]>;
       candleStoreRef.current = data;
       setCandlesByExchange(data);
+      // CHART-FIX-1: Force Chart.tsx to pick up the new store reference
+      setCandleTickVersion(prev => prev + 1);
+      // CHART-FIX-5: Force next candle_tick to bypass throttle
+      candleSyncRef.current = 0;
     });
     return unsub;
   }, [subscribe]);
