@@ -217,6 +217,10 @@ export default function Chart({
     if (!widgetRef.current || !readyRef.current) return;
     if (activeSymbolRef.current === newSymbol) return;
     try {
+      // Reset datafeed cache before switching — forces TradingView to re-fetch all bars
+      if (datafeedRef.current) {
+        datafeedRef.current.resetForSymbolSwitch();
+      }
       widgetRef.current.activeChart().setSymbol(newSymbol);
       activeSymbolRef.current = newSymbol;
     } catch (_) { /* ignore */ }

@@ -655,69 +655,87 @@ export function startEngine(
       console.log(`[CANDLES] Loaded ${binanceSpot.size} historical candles for BINANCE:SPOT`);
     }
 
-    // Bybit & OKX: single fetch (lower limits, not worth paginating)
-    const otherSources = [
-      {
-        key: 'BYBIT:PERP',
-        url: 'https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=1&limit=1000',
-        parser: 'bybit' as const,
-      },
-      {
-        key: 'OKX:PERP',
-        url: 'https://www.okx.com/api/v5/market/candles?instId=BTC-USDT-SWAP&bar=1m&limit=300',
-        parser: 'okx' as const,
-      },
-    ];
+    // Bybit: paginated fetch (3 pages × 1000 = ~3000 candles = ~2 days)
+    const bybitCandles = await fetchBybitPaginated(
+      'https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=1',
+      'BYBIT:PERP', 3,
+    );
+    if (bybitCandles.size > 0) {
+      candlesByExchange.set('BYBIT:PERP', bybitCandles);
+      sortedCandleArrays.set('BYBIT:PERP', Array.from(bybitCandles.values()).sort((a, b) => a.time - b.time));
+      console.log(`[CANDLES] Loaded ${bybitCandles.size} historical candles for BYBIT:PERP`);
+    }
 
-    for (const src of otherSources) {
-      try {
-        const res = await fetch(src.url);
-        if (!res.ok) { console.log(`[CANDLES] Failed to fetch ${src.key}: ${res.status}`); continue; }
+    // OKX: single fetch (API limit 300)
+    try {
+      const res = await fetch('https://www.okx.com/api/v5/market/candles?instId=BTC-USDT-SWAP&bar=1m&limit=300');
+      if (res.ok) {
         const json = await res.json();
-
         const candles = new Map<number, Candle>();
-
-        if (src.parser === 'bybit') {
-          const list = json?.result?.list;
-          if (Array.isArray(list)) {
-            for (const k of list) {
-              const time = Math.floor(Number(k[0]) / 1000);
-              candles.set(time, {
-                time,
-                open: parseFloat(k[1]),
-                high: parseFloat(k[2]),
-                low: parseFloat(k[3]),
-                close: parseFloat(k[4]),
-                volume: parseFloat(k[6]) || parseFloat(k[5]),
-              });
-            }
-          }
-        } else if (src.parser === 'okx') {
-          const data = json?.data;
-          if (Array.isArray(data)) {
-            for (const k of data) {
-              const time = Math.floor(Number(k[0]) / 1000);
-              candles.set(time, {
-                time,
-                open: parseFloat(k[1]),
-                high: parseFloat(k[2]),
-                low: parseFloat(k[3]),
-                close: parseFloat(k[4]),
-                volume: parseFloat(k[7]) || parseFloat(k[5]),
-              });
-            }
+        const data = json?.data;
+        if (Array.isArray(data)) {
+          for (const k of data) {
+            const time = Math.floor(Number(k[0]) / 1000);
+            candles.set(time, {
+              time,
+              open: parseFloat(k[1]),
+              high: parseFloat(k[2]),
+              low: parseFloat(k[3]),
+              close: parseFloat(k[4]),
+              volume: parseFloat(k[7]) || parseFloat(k[5]),
+            });
           }
         }
-
         if (candles.size > 0) {
-          candlesByExchange.set(src.key, candles);
-          sortedCandleArrays.set(src.key, Array.from(candles.values()).sort((a, b) => a.time - b.time));
-          console.log(`[CANDLES] Loaded ${candles.size} historical candles for ${src.key}`);
+          candlesByExchange.set('OKX:PERP', candles);
+          sortedCandleArrays.set('OKX:PERP', Array.from(candles.values()).sort((a, b) => a.time - b.time));
+          console.log(`[CANDLES] Loaded ${candles.size} historical candles for OKX:PERP`);
         }
+      }
+    } catch (err: any) {
+      console.log(`[CANDLES] Error fetching OKX:PERP: ${err.message}`);
+    }
+  }
+
+  // Paginated Bybit kline fetch (returns newest-first, we paginate backwards)
+  async function fetchBybitPaginated(
+    baseUrl: string, key: string, pages: number = 3,
+  ): Promise<Map<number, Candle>> {
+    const candles = new Map<number, Candle>();
+    let endMs: number | null = null;
+
+    for (let page = 0; page < pages; page++) {
+      try {
+        let url = `${baseUrl}&limit=1000`;
+        if (endMs) url += `&end=${endMs}`;
+        const res = await fetch(url);
+        if (!res.ok) { console.log(`[CANDLES] Bybit page ${page} failed for ${key}: ${res.status}`); break; }
+        const json = await res.json();
+        const list = json?.result?.list;
+        if (!Array.isArray(list) || list.length === 0) break;
+
+        for (const k of list) {
+          const time = Math.floor(Number(k[0]) / 1000);
+          candles.set(time, {
+            time,
+            open: parseFloat(k[1]),
+            high: parseFloat(k[2]),
+            low: parseFloat(k[3]),
+            close: parseFloat(k[4]),
+            volume: parseFloat(k[6]) || parseFloat(k[5]),
+          });
+        }
+
+        // Bybit returns newest first — last item is the oldest
+        const oldestOpenTimeMs = Number(list[list.length - 1][0]);
+        endMs = oldestOpenTimeMs - 1;
+        console.log(`[CANDLES] ${key} page ${page + 1}: fetched ${list.length} candles (total: ${candles.size})`);
       } catch (err: any) {
-        console.log(`[CANDLES] Error fetching ${src.key}: ${err.message}`);
+        console.log(`[CANDLES] Error fetching ${key} page ${page}: ${err.message}`);
+        break;
       }
     }
+    return candles;
   }
 
   // Fetch history and seed Phase A modules

@@ -80,6 +80,14 @@ export class MackuantDatafeed {
     this.store = store;
   }
 
+  /** Reset state when switching symbol — clears cache and forces TradingView to re-fetch */
+  resetForSymbolSwitch() {
+    this.barCache.clear();
+    this.lastBarBySubscriber.clear();
+    this.initialDataLoaded = false;
+    this.lastBarCount = 0;
+  }
+
   /** Called externally on each candle update to push real-time updates */
   onRealtimeUpdate() {
     // Detect when full history arrives (big jump in bar count)
