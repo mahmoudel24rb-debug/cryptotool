@@ -99,6 +99,9 @@ export const SCENARIO_CONFIG = {
   } as Record<string, number>,
   DEFAULT_SIGNAL_TTL_MS: 5 * 60 * 1000,
 
+  // Absolute max TTL for any scenario (even high-score ones)
+  MAX_SCENARIO_TTL_MS: 2 * 60 * 60 * 1000, // 2h absolute max
+
   // Phase 4 — Logging
   SCENARIO_LOG_PATH: './data/scenario_outcomes.jsonl',
   ACTIVE_SCENARIOS_PATH: './data/active_scenarios.json',
@@ -271,6 +274,23 @@ export class ConfluenceEngine {
 
   /** Feed a new signal into the engine — triggers evaluation */
   addSignal(signal: ConfluenceSignal): void {
+    // Dedup: if same type + direction exists within 30s, keep strongest only
+    const DEDUP_WINDOW_MS = 30_000;
+    const now = Date.now();
+    const dupIndex = this.signals.findIndex(s =>
+      s.type === signal.type &&
+      s.direction === signal.direction &&
+      (now - s.timestamp) < DEDUP_WINDOW_MS
+    );
+
+    if (dupIndex !== -1) {
+      const existing = this.signals[dupIndex];
+      if ((signal.strength ?? 0) > (existing.strength ?? 0)) {
+        this.signals[dupIndex] = signal;
+      }
+      return; // no re-evaluate on duplicate
+    }
+
     this.signals.push(signal);
     this.pruneOldSignals();
     this.evaluate();
@@ -441,10 +461,13 @@ export class ConfluenceEngine {
       Math.abs(s.price - this.currentPrice) / this.currentPrice < 0.01
     );
     if (nearPrice.length >= 2) {
-      const isNew = !zones.some(z =>
-        z.length === nearPrice.length && z.every((s, i) => s === nearPrice[i])
-      );
-      if (isNew) zones.push(nearPrice);
+      // Check if this group overlaps significantly with existing zones
+      const nearPriceSet = new Set(nearPrice);
+      const isRedundant = zones.some(z => {
+        const overlap = z.filter(s => nearPriceSet.has(s)).length;
+        return overlap >= Math.min(z.length, nearPrice.length) * 0.5;
+      });
+      if (!isRedundant) zones.push(nearPrice);
     }
 
     return zones;
@@ -606,8 +629,12 @@ export class ConfluenceEngine {
 
       const overlap = overlapSize / minZoneSize;
       if (overlap >= SCENARIO_CONFIG.DEDUP_OVERLAP_THRESHOLD) {
-        // If new score is higher, replace the existing one
-        if (adjustedScore > existing.score) {
+        // Never replace ACTIVE scenarios (already in entry zone)
+        if (existing.status === 'ACTIVE') {
+          return true; // skip the new one, existing is live
+        }
+        // Only replace PENDING if new score is better
+        if (existing.status === 'PENDING' && adjustedScore > existing.score) {
           existing.status = 'INVALIDATED';
           existing.invalidationReason = 'Replaced by higher-score scenario in same zone';
           this.emit('scenario:invalidated', existing);
@@ -615,7 +642,7 @@ export class ConfluenceEngine {
           this.activeScenarios = this.activeScenarios.filter(s => s.id !== existing.id);
           return false; // allow the new one
         }
-        return true; // existing is better, skip
+        return true; // existing is better or active, skip new
       }
     }
     return false;
@@ -731,13 +758,16 @@ export class ConfluenceEngine {
     for (const sc of this.activeScenarios) {
       if (sc.status === 'INVALIDATED' || sc.status === 'EXPIRED' || sc.status === 'TP3_HIT') continue;
 
-      // Expiration only for PENDING and ACTIVE (TP-hit scenarios keep tracking)
-      // High-score scenarios (40+) never expire — they stay until SL or TP
+      // Expiration: low-score expire at expiresAt, ALL expire at absolute max TTL
       const adjScore = sc.meta?.adjustedScore ?? sc.score;
-      if ((sc.status === 'PENDING' || sc.status === 'ACTIVE') && now >= sc.expiresAt && adjScore < 40) {
+      const age = now - sc.createdAt;
+      const normalExpiry = now >= sc.expiresAt && adjScore < 40;
+      const absoluteExpiry = age >= SCENARIO_CONFIG.MAX_SCENARIO_TTL_MS;
+
+      if ((sc.status === 'PENDING' || sc.status === 'ACTIVE') && (normalExpiry || absoluteExpiry)) {
         sc.status = 'EXPIRED';
         sc.exitTime = now;
-        sc.exitReason = 'Expired';
+        sc.exitReason = absoluteExpiry ? 'Max TTL reached' : 'Expired';
         this.emit('scenario:expired', sc);
         this.logOutcome(sc);
         continue;
@@ -809,9 +839,9 @@ export class ConfluenceEngine {
             sc.tp1HitTime = now;
             sc.tp1HitPrice = price;
             sc.updatedAt = now;
-            // Trailing SL: move SL to breakeven
+            // Trailing SL: move SL to worst-case breakeven
             if (SCENARIO_CONFIG.TRAILING_SL_ENABLED) {
-              sc.stopLoss = (sc.entryLow + sc.entryHigh) / 2; // breakeven
+              sc.stopLoss = isLong ? sc.entryLow : sc.entryHigh;
             }
             this.emit('scenario:update', sc);
           }
@@ -987,14 +1017,15 @@ export class ConfluenceEngine {
       let restored = 0;
 
       for (const sc of data.scenarios) {
-        // Skip if already expired (expiresAt passed while server was down)
-        // High-score scenarios (40+) never expire
+        // Skip if already expired (expiresAt passed or max TTL reached while server was down)
         const adjScore = sc.meta?.adjustedScore ?? sc.score;
-        if ((sc.status === 'PENDING' || sc.status === 'ACTIVE') && sc.expiresAt && now >= sc.expiresAt && adjScore < 40) {
-          // Log as expired outcome
+        const age = now - sc.createdAt;
+        const normalExpiry = sc.expiresAt && now >= sc.expiresAt && adjScore < 40;
+        const absoluteExpiry = age >= SCENARIO_CONFIG.MAX_SCENARIO_TTL_MS;
+        if ((sc.status === 'PENDING' || sc.status === 'ACTIVE') && (normalExpiry || absoluteExpiry)) {
           sc.status = 'EXPIRED';
-          sc.exitTime = sc.expiresAt;
-          sc.exitReason = 'Expired during server restart';
+          sc.exitTime = now;
+          sc.exitReason = absoluteExpiry ? 'Max TTL reached during restart' : 'Expired during server restart';
           this.logOutcome(sc);
           continue;
         }

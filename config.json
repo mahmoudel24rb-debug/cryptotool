@@ -48,7 +48,7 @@
     },
     "exhaustion": {
       "enabled": true,
-      "minPriceDropUsd": 50,
+      "minPriceMoveUsd": 50,
       "maxVolumeUsd": 100000,
       "windowSeconds": 30
     },

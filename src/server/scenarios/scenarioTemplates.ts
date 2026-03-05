@@ -22,9 +22,9 @@ const TEMPLATES: ScenarioTemplate[] = [
     id: 2,
     name: 'Liquidity Sweep + Reversal',
     description: 'Stop hunt institutionnel — sweep puis reversal confirmé',
-    requiredSignals: ['LIQUIDITY_SWEEP'],
-    bonusSignals: ['ORDER_BLOCK', 'ABSORPTION', 'LIQUIDATION'],
-    minRequiredCount: 1,
+    requiredSignals: ['LIQUIDITY_SWEEP', 'ORDER_BLOCK', 'ABSORPTION'],
+    bonusSignals: ['LIQUIDATION', 'FVG', 'STRUCTURE'],
+    minRequiredCount: 2,  // sweep + at least one confirmation
   },
   {
     id: 3,

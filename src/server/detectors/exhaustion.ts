@@ -2,7 +2,7 @@ import { NormalizedTrade } from '../exchanges/types';
 import { Alert, createAlert, formatUsd } from './types';
 
 interface ExhaustionConfig {
-  minPriceDropUsd: number;
+  minPriceMoveUsd: number;  // renamed from minPriceDropUsd — used for both drops and rises
   maxVolumeUsd: number;
   windowSeconds: number;
 }
@@ -42,28 +42,30 @@ export class ExhaustionDetector {
     }
 
     // Bullish Exhaustion: price dropped significantly on low volume → sellers exhausted
-    if (priceDropUsd >= this.config.minPriceDropUsd && totalVolume <= this.config.maxVolumeUsd) {
+    if (priceDropUsd >= this.config.minPriceMoveUsd && totalVolume <= this.config.maxVolumeUsd) {
       this.lastAlertTime.set(key, Date.now());
+      const strength = Math.min(1.0, priceDropUsd / (this.config.minPriceMoveUsd * 3));
       return createAlert(
         'EXHAUSTION',
         latestTrade.exchange,
         latestTrade.market,
         latestTrade.symbol,
         `Bullish Exhaustion! ${key} dropped $${priceDropUsd.toFixed(2)} on mere ${formatUsd(totalVolume)} volume. Sellers exhausted.`,
-        { priceDropUsd, totalVolume },
+        { priceDropUsd, totalVolume, strength },
       );
     }
 
     // Bearish Exhaustion: price rose significantly on low volume → buyers exhausted
-    if (priceRiseUsd >= this.config.minPriceDropUsd && totalVolume <= this.config.maxVolumeUsd) {
+    if (priceRiseUsd >= this.config.minPriceMoveUsd && totalVolume <= this.config.maxVolumeUsd) {
       this.lastAlertTime.set(key, Date.now());
+      const strength = Math.min(1.0, priceRiseUsd / (this.config.minPriceMoveUsd * 3));
       return createAlert(
         'EXHAUSTION',
         latestTrade.exchange,
         latestTrade.market,
         latestTrade.symbol,
         `Bearish Exhaustion! ${key} rose $${priceRiseUsd.toFixed(2)} on mere ${formatUsd(totalVolume)} volume. Buyers exhausted.`,
-        { priceRiseUsd, totalVolume },
+        { priceRiseUsd, totalVolume, strength },
       );
     }
 

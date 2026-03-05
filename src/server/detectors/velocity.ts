@@ -69,6 +69,8 @@ export class VelocityDetector {
 
     this.lastAlertTime.set(key, Date.now());
 
+    const strength = Math.min(1.0, Math.abs(cvdShift) / (this.config.minCvdShiftUsd * 3));
+
     if (keyEvents.length >= this.config.minClusterCount) {
       const direction = cvdShift > 0 ? 'Buy' : 'Sell';
       return createAlert(
@@ -77,7 +79,7 @@ export class VelocityDetector {
         latestTrade.market,
         latestTrade.symbol,
         `[VELOCITY] Flash ${direction} Cluster! ${key} CVD shifted ${formatUsd(Math.abs(cvdShift))} in under ${this.config.windowSeconds}s.`,
-        { cvdShift, clusterCount: keyEvents.length },
+        { cvdShift, clusterCount: keyEvents.length, strength },
       );
     }
 
@@ -88,7 +90,7 @@ export class VelocityDetector {
       latestTrade.market,
       latestTrade.symbol,
       `[VELOCITY] Flash ${direction}! ${key} CVD shifted ${formatUsd(Math.abs(cvdShift))} in under ${this.config.windowSeconds}s.`,
-      { cvdShift },
+      { cvdShift, strength },
     );
   }
 }

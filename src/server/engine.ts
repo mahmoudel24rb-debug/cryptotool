@@ -460,6 +460,30 @@ export function startEngine(
   let lastDetectorTrade: NormalizedTrade | null = null;
   const DETECTOR_MIN_INTERVAL_MS = 50; // 20 Hz max
 
+  // Robust direction extraction from alert details (not message strings)
+  function getAlertDirection(alert: Alert): 'LONG' | 'SHORT' {
+    const d = (alert as any).details;
+    const type = alert.type || '';
+    switch (type) {
+      case 'ABSORPTION':
+        return d?.dominantSide === 'SELL' ? 'LONG' : 'SHORT';
+      case 'SPIKE':
+        return d?.side === 'BUY' ? 'LONG' : 'SHORT';
+      case 'VELOCITY':
+        return d?.cvdShift > 0 ? 'LONG' : 'SHORT';
+      case 'EXHAUSTION':
+        return d?.priceDropUsd > 0 ? 'LONG' : 'SHORT';
+      case 'DIVERGENCE':
+        return d?.cvd > 0 ? 'LONG' : 'SHORT';
+      case 'TWAP':
+        return d?.side === 'BUY' ? 'LONG' : 'SHORT';
+      case 'LIQUIDATION':
+        return d?.side === 'LONG' ? 'SHORT' : 'LONG';
+      default:
+        return 'LONG';
+    }
+  }
+
   // Throttle alert broadcasts: batch alerts and send max 5x/sec
   let alertQueue: Alert[] = [];
   let alertFlushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -844,35 +868,38 @@ export function startEngine(
 
   // ── CVD (Cumulative Volume Delta) per minute ──
   // CVD = cumulative (buyVolume - sellVolume) aligned to 1-minute buckets
-  // We store per-minute delta and compute cumulative on broadcast
-  const cvdPerMinute = new Map<number, number>(); // minuteTs → delta for that minute
-  let cvdRunningTotal = 0; // running total across all minutes
+  // Maintained incrementally — no sort or reduce needed on broadcast
+  const cvdEntries: { time: number; delta: number; cumulative: number }[] = [];
+  let cvdCumulative = 0;
 
   function updateCvd(trade: NormalizedTrade) {
     const minuteTs = Math.floor(trade.timestamp / 60000) * 60;
     const delta = trade.side === 'BUY' ? trade.usdValue : -trade.usdValue;
 
-    const current = cvdPerMinute.get(minuteTs) || 0;
-    cvdPerMinute.set(minuteTs, current + delta);
-
-    // Prune old entries
-    if (cvdPerMinute.size > MAX_CANDLES + 10) {
-      const keys = Array.from(cvdPerMinute.keys()).sort((a, b) => a - b);
-      for (let i = 0; i < keys.length - MAX_CANDLES; i++) {
-        cvdPerMinute.delete(keys[i]);
+    const last = cvdEntries[cvdEntries.length - 1];
+    if (last && last.time === minuteTs) {
+      last.delta += delta;
+      last.cumulative = (cvdEntries.length > 1 ? cvdEntries[cvdEntries.length - 2].cumulative : 0) + last.delta;
+      cvdCumulative = last.cumulative;
+    } else {
+      cvdCumulative += delta;
+      cvdEntries.push({ time: minuteTs, delta, cumulative: cvdCumulative });
+      // Prune old entries (rare)
+      if (cvdEntries.length > MAX_CANDLES) {
+        cvdEntries.splice(0, cvdEntries.length - MAX_CANDLES);
+        // Recalculate cumulative from scratch after prune
+        let cum = 0;
+        for (const e of cvdEntries) {
+          cum += e.delta;
+          e.cumulative = cum;
+        }
+        cvdCumulative = cum;
       }
     }
   }
 
   function getCvdSeries(): { time: number; value: number }[] {
-    const sorted = Array.from(cvdPerMinute.entries()).sort((a, b) => a[0] - b[0]);
-    const series: { time: number; value: number }[] = [];
-    let cumulative = 0;
-    for (const [time, delta] of sorted) {
-      cumulative += delta;
-      series.push({ time, value: cumulative });
-    }
-    return series;
+    return cvdEntries.map(e => ({ time: e.time, value: e.cumulative }));
   }
 
   // ── Trade batching: buffer trades and process every 100ms ──
@@ -1009,31 +1036,14 @@ export function startEngine(
       for (const alert of alerts) {
         trendAnalyzer.onAlert(alert);
         queueAlert(alert);
-
-        const alertType = alert.type || '';
-        let dir: 'LONG' | 'SHORT' = 'LONG';
-        if (alertType === 'ABSORPTION') {
-          dir = (alert as any).details?.dominantSide === 'SELL' ? 'LONG' : 'SHORT';
-        } else if (alertType === 'SPIKE') {
-          dir = (alert as any).message?.includes('Buy') ? 'LONG' : 'SHORT';
-        } else if (alertType === 'VELOCITY') {
-          dir = (alert as any).message?.includes('Buy') ? 'LONG' : 'SHORT';
-        } else if (alertType === 'EXHAUSTION') {
-          dir = (alert as any).message?.includes('Bullish') ? 'LONG' : 'SHORT';
-        } else if (alertType === 'DIVERGENCE') {
-          dir = (alert as any).message?.includes('Bullish') ? 'LONG' : 'SHORT';
-        } else if (alertType === 'TWAP') {
-          dir = (alert as any).message?.includes('buying') ? 'LONG' : 'SHORT';
-        } else if (alertType === 'LIQUIDATION') {
-          dir = (alert as any).message?.includes('LONG') ? 'SHORT' : 'LONG';
-        }
-
+        const dir = getAlertDirection(alert);
         feedConfluence({
-          type: alertType,
+          type: alert.type,
           direction: dir,
           price: lastTrade.price,
           timestamp: Date.now(),
-          details: { description: (alert as any).message || alertType },
+          strength: (alert as any).details?.strength,
+          details: { description: (alert as any).message || alert.type },
         });
       }
     }

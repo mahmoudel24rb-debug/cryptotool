@@ -135,13 +135,13 @@ export class FundingRateMonitor {
 
         let interpretation: string;
         if (rate > 0.001) {
-          interpretation = 'Marché surchauffé — longs paient cher, risque de dump';
+          interpretation = 'Overheated market — longs paying heavily, dump risk';
         } else if (rate > this.config.extremePositiveThreshold) {
-          interpretation = 'Funding élevé — sentiment bullish dominant';
+          interpretation = 'High funding — dominant bullish sentiment';
         } else if (rate < -0.0005) {
-          interpretation = 'Panic shorting — potentiel short squeeze';
+          interpretation = 'Panic shorting — potential short squeeze';
         } else {
-          interpretation = 'Funding négatif — sentiment bearish';
+          interpretation = 'Negative funding — bearish sentiment';
         }
 
         this.alertCallback({
@@ -167,7 +167,7 @@ export class FundingRateMonitor {
             symbol: 'BTC',
             currentRate: rate,
             rateAnnualized: rate * 3 * 365 * 100,
-            interpretation: `Funding flip ${prevSign > 0 ? 'positive→negative' : 'negative→positive'} — changement de sentiment`,
+            interpretation: `Funding flip ${prevSign > 0 ? 'positive→negative' : 'negative→positive'} — sentiment shift`,
             cascadeRisk: 'MEDIUM',
             timestamp: Date.now(),
           });

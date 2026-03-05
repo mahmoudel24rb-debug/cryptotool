@@ -73,7 +73,8 @@ export class BasisTracker {
 
     // Also compute cross-exchange basis if we have a global spot and perp
     // e.g., Binance Futures perp vs Coinbase spot
-    const anyPerp = this.perpPrices.values().next().value;
+    const anyPerp = this.perpPrices.get('BINANCE_FUTURES')
+      ?? this.perpPrices.values().next().value;
     const coinbaseSpot = this.spotPrices.get('COINBASE');
     if (anyPerp && coinbaseSpot && coinbaseSpot > 0 && results.length === 0) {
       const basis = anyPerp - coinbaseSpot;

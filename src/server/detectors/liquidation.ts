@@ -36,13 +36,14 @@ export class LiquidationDetector {
 
     if (totalUsd >= this.config.minLiquidationUsd) {
       this.lastAlertTime.set(key, Date.now());
+      const strength = Math.min(1.0, totalUsd / (this.config.minLiquidationUsd * 3));
       return createAlert(
         'LIQUIDATION',
         latestLiq.exchange,
         'PERP',
         latestLiq.symbol,
         `Massive ${latestLiq.side} Liquidation: ${formatUsd(totalUsd)} wiped out on ${latestLiq.exchange}:${latestLiq.symbol}.`,
-        { totalUsd, side: latestLiq.side, count: windowLiqs.length },
+        { totalUsd, side: latestLiq.side, count: windowLiqs.length, strength },
       );
     }
 

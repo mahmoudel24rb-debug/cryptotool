@@ -46,29 +46,39 @@ export class AbsorptionDetector {
     const midPrice = (minPrice + maxPrice) / 2;
     const priceMovePct = midPrice > 0 ? ((maxPrice - minPrice) / midPrice) * 100 : 0;
 
-    // Bearish Absorption: heavy buying but price didn't move up
-    if (buyVolume >= this.config.minVolumeUsd && priceMovePct <= this.config.maxPriceMovePct) {
+    // Bearish Absorption: heavy buying absorbed (buyers dominated but price didn't move)
+    if (
+      buyVolume >= this.config.minVolumeUsd &&
+      buyVolume > sellVolume * 1.3 &&
+      priceMovePct <= this.config.maxPriceMovePct
+    ) {
       this.lastAlertTime.set(key, Date.now());
+      const strength = Math.min(1.0, buyVolume / (this.config.minVolumeUsd * 3));
       return createAlert(
         'ABSORPTION',
         latestTrade.exchange,
         latestTrade.market,
         latestTrade.symbol,
         `Bearish Absorption! Heavy buying (+${formatUsd(buyVolume)}) absorbed by limit sellers on ${key}.`,
-        { buyVolume, sellVolume, priceMovePct },
+        { buyVolume, sellVolume, priceMovePct, dominantSide: 'BUY', strength },
       );
     }
 
-    // Bullish Absorption: heavy selling but price didn't move down
-    if (sellVolume >= this.config.minVolumeUsd && priceMovePct <= this.config.maxPriceMovePct) {
+    // Bullish Absorption: heavy selling absorbed (sellers dominated but price didn't move)
+    if (
+      sellVolume >= this.config.minVolumeUsd &&
+      sellVolume > buyVolume * 1.3 &&
+      priceMovePct <= this.config.maxPriceMovePct
+    ) {
       this.lastAlertTime.set(key, Date.now());
+      const strength = Math.min(1.0, sellVolume / (this.config.minVolumeUsd * 3));
       return createAlert(
         'ABSORPTION',
         latestTrade.exchange,
         latestTrade.market,
         latestTrade.symbol,
         `Bullish Absorption! Heavy selling (-${formatUsd(sellVolume)}) absorbed by limit buyers on ${key}.`,
-        { buyVolume, sellVolume, priceMovePct },
+        { buyVolume, sellVolume, priceMovePct, dominantSide: 'SELL', strength },
       );
     }
 

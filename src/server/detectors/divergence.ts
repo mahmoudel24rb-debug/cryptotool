@@ -69,7 +69,7 @@ export class DivergenceDetector {
       t => t.exchange === latestTrade.exchange &&
            t.symbol === latestTrade.symbol &&
            t.timestamp >= cutoff
-    );
+    ).sort((a, b) => a.timestamp - b.timestamp);
 
     if (windowTrades.length < 10) return null;
 
@@ -87,6 +87,8 @@ export class DivergenceDetector {
     const prefix = isMicro ? '[MICRO] ' : '';
     const key = `${latestTrade.exchange}:${latestTrade.symbol}`;
 
+    const strength = Math.min(1.0, Math.abs(cvd) / (minCvdChange * 5));
+
     // Bullish Divergence: price falling but CVD rising
     if (priceChangePct < -minPriceChange && cvd > minCvdChange) {
       this.lastAlertTime.set(alertKey, Date.now());
@@ -96,7 +98,7 @@ export class DivergenceDetector {
         latestTrade.market,
         latestTrade.symbol,
         `${prefix}Bullish Divergence! Price falling but ${key} CVD rising (+${formatUsd(cvd)}).`,
-        { cvd, priceChangePct, isMicro },
+        { cvd, priceChangePct, isMicro, strength },
       );
     }
 
@@ -109,7 +111,7 @@ export class DivergenceDetector {
         latestTrade.market,
         latestTrade.symbol,
         `${prefix}Bearish Divergence! Price rising but ${key} CVD dropping (-${formatUsd(Math.abs(cvd))}).`,
-        { cvd, priceChangePct, isMicro },
+        { cvd, priceChangePct, isMicro, strength },
       );
     }
 

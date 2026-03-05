@@ -62,14 +62,15 @@ export class SpikeDetector {
 
     if (multiplier >= this.config.spikeMultiplier && recentVolume >= this.config.minSpikeVolumeUsd) {
       this.lastAlertTime.set(key, Date.now());
-      const side = recentBuyVolume > recentSellVolume ? 'Buy' : 'Sell';
+      const side = recentBuyVolume > recentSellVolume ? 'BUY' : 'SELL';
+      const strength = Math.min(1.0, multiplier / (this.config.spikeMultiplier * 3));
       return createAlert(
         'SPIKE',
         latestTrade.exchange,
         latestTrade.market,
         latestTrade.symbol,
-        `Massive ${side} Spike on ${key}. Vol: ${formatUsd(recentVolume)}`,
-        { recentVolume, avgVolumePerWindow, multiplier, side },
+        `Massive ${side === 'BUY' ? 'Buy' : 'Sell'} Spike on ${key}. Vol: ${formatUsd(recentVolume)}`,
+        { recentVolume, avgVolumePerWindow, multiplier, side, strength },
       );
     }
 

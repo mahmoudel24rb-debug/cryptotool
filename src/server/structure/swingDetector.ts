@@ -24,15 +24,16 @@ export class SwingDetector {
    * Call this each time a new candle closes with the full candle array.
    * Returns newly detected swing points (if any).
    */
-  update(candles: Candle[]): SwingPoint[] {
+  update(candles: Candle[], endIndex?: number): SwingPoint[] {
     const { lookback } = this.config;
+    const len = endIndex ?? candles.length;
     const newSwings: SwingPoint[] = [];
 
-    if (candles.length < lookback * 2 + 1) return newSwings;
+    if (len < lookback * 2 + 1) return newSwings;
 
-    // We check the candle at position (length - 1 - lookback),
+    // We check the candle at position (len - 1 - lookback),
     // because we need `lookback` candles after it to confirm.
-    const checkIdx = candles.length - 1 - lookback;
+    const checkIdx = len - 1 - lookback;
 
     // Only process each index once
     if (checkIdx <= this.lastProcessedIndex) return newSwings;
@@ -43,7 +44,7 @@ export class SwingDetector {
     // Check swing high
     let isSwingHigh = true;
     for (let j = checkIdx - lookback; j <= checkIdx + lookback; j++) {
-      if (j === checkIdx || j < 0 || j >= candles.length) continue;
+      if (j === checkIdx || j < 0 || j >= len) continue;
       if (candles[j].high >= candidate.high) {
         isSwingHigh = false;
         break;
@@ -89,7 +90,7 @@ export class SwingDetector {
     }
 
     // Update broken status based on current price
-    const currentCandle = candles[candles.length - 1];
+    const currentCandle = candles[len - 1];
     for (const sh of this.swingHighs) {
       if (!sh.broken && currentCandle.close > sh.price) {
         sh.broken = true;
@@ -106,7 +107,7 @@ export class SwingDetector {
     return newSwings;
   }
 
-  /** Bulk process historical candles — runs through all of them */
+  /** Bulk process historical candles — runs through all of them (O(n), no slice) */
   processHistorical(candles: Candle[]): void {
     const { lookback } = this.config;
     if (candles.length < lookback * 2 + 1) return;
@@ -116,10 +117,9 @@ export class SwingDetector {
     this.swingLows = [];
     this.lastProcessedIndex = -1;
 
-    // Process each "closing" by expanding the array incrementally
+    // Process each "closing" by passing endIndex instead of slicing
     for (let end = lookback * 2 + 1; end <= candles.length; end++) {
-      const slice = candles.slice(0, end);
-      this.update(slice);
+      this.update(candles, end);
     }
   }
 

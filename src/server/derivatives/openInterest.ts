@@ -185,6 +185,10 @@ export class OpenInterestTracker {
       }
       if (!comparison) comparison = history[0]; // use oldest if window is short
 
+      // Guard: skip if comparison is too recent (< 50% of window)
+      const timeDiff = current.timestamp - comparison.timestamp;
+      if (timeDiff < windowMs * 0.5) continue;
+
       const oiChange = current.oi - comparison.oi;
       const oiChangePct = comparison.oi > 0 ? (oiChange / comparison.oi) * 100 : 0;
       const priceChange = current.price - comparison.price;
@@ -198,16 +202,16 @@ export class OpenInterestTracker {
 
       if (oiChangePct > 0 && pricePct > 0) {
         type = 'OI_SURGE';
-        interpretation = 'Longs agressifs — tendance haussière saine';
+        interpretation = 'Aggressive longs — healthy bullish trend';
       } else if (oiChangePct < 0 && pricePct > 0) {
         type = 'OI_FLUSH';
-        interpretation = 'Short squeeze — shorts ferment, mouvement fragile';
+        interpretation = 'Short squeeze — shorts closing, fragile move';
       } else if (oiChangePct > 0 && pricePct < 0) {
         type = 'OI_SURGE';
-        interpretation = 'Shorts agressifs — pression vendeuse, risque cascade';
+        interpretation = 'Aggressive shorts — selling pressure, cascade risk';
       } else {
         type = 'OI_FLUSH';
-        interpretation = 'Long squeeze / capitulation — longs liquidés';
+        interpretation = 'Long squeeze / capitulation — longs liquidated';
       }
 
       this.alertCallback({

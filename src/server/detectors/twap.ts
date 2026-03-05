@@ -69,13 +69,14 @@ export class TwapDetector {
       // TWAP detected!
       this.lastAlertTime.set(key, Date.now());
       const direction = side === 'BUY' ? 'buying' : 'selling';
+      const strength = Math.min(1.0, recent.length / (this.config.minOccurrences * 2));
       return createAlert(
         'TWAP',
         latestTrade.exchange,
         latestTrade.market,
         latestTrade.symbol,
         `[TWAP] Systematic algorithmic ${direction} detected on ${latestTrade.exchange}:${latestTrade.symbol}.`,
-        { side, avgSize, avgInterval, occurrences: recent.length },
+        { side, avgSize, avgInterval, occurrences: recent.length, strength },
       );
     }
 
