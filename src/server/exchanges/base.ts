@@ -37,7 +37,13 @@ export abstract class BaseExchangeConnector extends EventEmitter {
 
     ws.on('message', (raw: Buffer) => {
       try {
-        const data = JSON.parse(raw.toString());
+        const str = raw.toString();
+        // OKX sends plain-text "ping" — respond with "pong"
+        if (str === 'ping') {
+          ws.send('pong');
+          return;
+        }
+        const data = JSON.parse(str);
         onMessage(data);
       } catch (err) {
         // Binary or non-JSON messages — ignore

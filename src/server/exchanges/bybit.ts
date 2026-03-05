@@ -20,7 +20,14 @@ export class BybitConnector extends BaseExchangeConnector {
         op: 'subscribe',
         args: ['publicTrade.BTCUSDT', 'orderbook.25.BTCUSDT'],
       }));
+      this.startBybitHeartbeat(ws, 'spot');
     }, (data) => {
+      if (data.op === 'ping') {
+        const ws = this.connections.get('spot');
+        if (ws?.readyState === 1) ws.send(JSON.stringify({ op: 'pong' }));
+        return;
+      }
+      if (data.op === 'pong' || data.op === 'subscribe') return;
       if (data.topic?.startsWith('publicTrade')) {
         this.handleTrades(data, 'SPOT');
       } else if (data.topic?.startsWith('orderbook')) {
@@ -37,7 +44,14 @@ export class BybitConnector extends BaseExchangeConnector {
         op: 'subscribe',
         args: ['publicTrade.BTCUSDT', 'orderbook.25.BTCUSDT', 'liquidation.BTCUSDT'],
       }));
+      this.startBybitHeartbeat(ws, 'perp');
     }, (data) => {
+      if (data.op === 'ping') {
+        const ws = this.connections.get('perp');
+        if (ws?.readyState === 1) ws.send(JSON.stringify({ op: 'pong' }));
+        return;
+      }
+      if (data.op === 'pong' || data.op === 'subscribe') return;
       if (data.topic?.startsWith('publicTrade')) {
         this.handleTrades(data, 'PERP');
       } else if (data.topic?.startsWith('orderbook')) {
@@ -46,6 +60,18 @@ export class BybitConnector extends BaseExchangeConnector {
         this.handleLiquidation(data);
       }
     });
+  }
+
+  /** Send application-level pings to Bybit every 20s (Bybit requires this to keep alive) */
+  private startBybitHeartbeat(ws: WebSocket, id: string) {
+    const interval = setInterval(() => {
+      if (ws.readyState === 1) {
+        ws.send(JSON.stringify({ op: 'ping' }));
+      } else {
+        clearInterval(interval);
+      }
+    }, 20000);
+    ws.on('close', () => clearInterval(interval));
   }
 
   private handleTrades(data: any, market: string) {
