@@ -231,7 +231,36 @@ interface ScenarioOutcome {
   tp2Hit: boolean;
   tp3Hit: boolean;
   timeframe: string;
+  llmVerdict?: 'APPROVE' | 'REDUCE' | 'REJECT' | null;
+  llmConfidence?: number | null;
+  tp2?: number;
+  tp3?: number;
+  initialRisk?: number;
+  initialSl?: number;
+  activationPrice?: number | null;
 }
+
+// R réalisé (modèle en tiers : 1/3 à chaque TP, reste au prix de sortie).
+// Le label "TP1" seul est trompeur : un trade peut toucher TP1 puis rendre
+// le reste au stop suiveur — le R dit la vérité du P&L.
+function realizedR(t: ScenarioOutcome): number | null {
+  const fill = t.activationPrice ?? t.entryMid; // le R se mesure depuis le fill réel
+  const risk = t.initialRisk ?? (t.initialSl != null ? Math.abs(fill - t.initialSl) : null);
+  if (!risk || risk <= 0) return null;
+  const dir = t.direction === 'LONG' ? 1 : -1;
+  const rOf = (px: number) => dir * (px - fill) / risk;
+  const exit = t.exitPrice ?? fill;
+  if (t.tp3Hit && t.tp2 != null && t.tp3 != null) return (rOf(t.tp1) + rOf(t.tp2) + rOf(t.tp3)) / 3;
+  if (t.tp2Hit && t.tp2 != null) return (rOf(t.tp1) + rOf(t.tp2) + rOf(exit)) / 3;
+  if (t.tp1Hit) return (rOf(t.tp1) + 2 * rOf(exit)) / 3;
+  return rOf(exit);
+}
+
+const LLM_VERDICT_COLORS: Record<string, string> = {
+  APPROVE: '#22c55e',
+  REDUCE: '#eab308',
+  REJECT: '#ef4444',
+};
 
 const mono = "'JetBrains Mono', monospace";
 
@@ -257,7 +286,8 @@ function TradeJournal() {
     const tp3 = trades.filter(t => t.tp3Hit).length;
     const expired = trades.filter(t => t.finalStatus === 'EXPIRED').length;
     const winrate = total > 0 ? ((tp1 / total) * 100).toFixed(1) : '0';
-    return { total, slHits, tp1, tp2, tp3, expired, winrate };
+    const sumR = trades.reduce((s, t) => s + (realizedR(t) ?? 0), 0);
+    return { total, slHits, tp1, tp2, tp3, expired, winrate, sumR };
   }, [trades]);
 
   const statusColor = (t: ScenarioOutcome) => {
@@ -306,6 +336,7 @@ function TradeJournal() {
         <span style={{ color: '#22c55e' }}>TP3: {stats.tp3}</span>
         <span style={{ color: '#ef4444' }}>SL: {stats.slHits}</span>
         <span style={{ color: '#6b7280' }}>EXP: {stats.expired}</span>
+        <span>ΣR: <span style={{ color: stats.sumR >= 0 ? '#22c55e' : '#ef4444', fontWeight: 700 }}>{stats.sumR >= 0 ? '+' : ''}{stats.sumR.toFixed(2)}R</span></span>
         <button
           onClick={() => {
             setLoading(true);
@@ -324,14 +355,16 @@ function TradeJournal() {
       {/* Table header */}
       <div style={{
         display: 'grid',
-        gridTemplateColumns: '110px 50px 55px 180px 75px 75px 50px 55px 75px 75px',
+        gridTemplateColumns: '105px 48px 48px 150px 65px 70px 70px 48px 55px 52px 65px 65px',
         padding: '6px 20px', borderBottom: '1px solid #1e293b',
         fontFamily: mono, fontSize: 9, fontWeight: 700, color: '#6b7280', flexShrink: 0,
       }}>
         <span>DATE</span><span>DIR</span><span>SCORE</span><span>TEMPLATE</span>
+        <span style={{ textAlign: 'center' }}>IA</span>
         <span style={{ textAlign: 'right' }}>ENTRY</span>
         <span style={{ textAlign: 'right' }}>EXIT</span>
         <span style={{ textAlign: 'center' }}>RESULT</span>
+        <span style={{ textAlign: 'right' }}>R</span>
         <span style={{ textAlign: 'center' }}>DUREE</span>
         <span style={{ textAlign: 'right' }}>MFE</span>
         <span style={{ textAlign: 'right' }}>MAE</span>
@@ -348,7 +381,7 @@ function TradeJournal() {
             key={t.id}
             style={{
               display: 'grid',
-              gridTemplateColumns: '110px 50px 55px 180px 75px 75px 50px 55px 75px 75px',
+              gridTemplateColumns: '105px 48px 48px 150px 65px 70px 70px 48px 55px 52px 65px 65px',
               padding: '5px 20px',
               borderBottom: '1px solid #111827',
               fontFamily: mono, fontSize: 10, color: '#d1d5db',
@@ -359,9 +392,17 @@ function TradeJournal() {
             <span style={{ color: t.direction === 'LONG' ? '#22c55e' : '#ef4444', fontWeight: 700 }}>{t.direction}</span>
             <span style={{ color: t.adjustedScore >= 40 ? '#ffd700' : '#9ca3af' }}>{t.adjustedScore}</span>
             <span style={{ color: '#8b9dc3', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.template}</span>
-            <span style={{ textAlign: 'right' }}>${t.entryMid.toFixed(0)}</span>
+            <span style={{ textAlign: 'center', color: t.llmVerdict ? LLM_VERDICT_COLORS[t.llmVerdict] ?? '#6b7280' : '#374151', fontWeight: 700 }}>
+              {t.llmVerdict ? `${t.llmVerdict.slice(0, 3)} ${t.llmConfidence ?? ''}` : '—'}
+            </span>
+            <span style={{ textAlign: 'right' }} title={t.activationPrice ? `fill réel (zone mid $${t.entryMid.toFixed(0)})` : 'jamais rempli'}>
+              {t.activationPrice ? `$${t.activationPrice.toFixed(0)}` : `($${t.entryMid.toFixed(0)})`}
+            </span>
             <span style={{ textAlign: 'right' }}>{t.exitPrice ? `$${t.exitPrice.toFixed(0)}` : '—'}</span>
             <span style={{ textAlign: 'center', color: statusColor(t), fontWeight: 700 }}>{statusLabel(t)}</span>
+            <span style={{ textAlign: 'right', fontWeight: 700, color: (realizedR(t) ?? 0) > 0.05 ? '#22c55e' : (realizedR(t) ?? 0) < -0.05 ? '#ef4444' : '#9ca3af' }}>
+              {realizedR(t) != null ? `${realizedR(t)! >= 0 ? '+' : ''}${realizedR(t)!.toFixed(2)}` : '—'}
+            </span>
             <span style={{ textAlign: 'center', color: '#6b7280' }}>{fmtDuration(t.durationMs)}</span>
             <span style={{ textAlign: 'right', color: '#22c55e' }}>{t.maxFavorableExcursion != null ? `$${t.maxFavorableExcursion.toFixed(0)}` : '—'}</span>
             <span style={{ textAlign: 'right', color: '#ef4444' }}>{t.maxAdverseExcursion != null ? `$${t.maxAdverseExcursion.toFixed(0)}` : '—'}</span>

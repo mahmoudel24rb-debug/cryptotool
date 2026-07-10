@@ -102,6 +102,16 @@ export class MackuantDatafeed {
         sub.onResetCache();
         resetGuids.add(guid);
       }
+
+      // Store replaced with shorter history (reconnect after server restart):
+      // reset instead of streaming bars that go back in time
+      if (currentCount > 0 && currentCount < lastCount - 10) {
+        this.barCache.clear();
+        this.lastBarBySubscriber.delete(guid);
+        sub.onResetCache();
+        resetGuids.add(guid);
+      }
+
       this.lastBarCountBySymbol.set(sub.symbolName, currentCount);
     }
 
@@ -161,6 +171,16 @@ export class MackuantDatafeed {
         close: lastBar.close,
         volume: lastBar.volume,
       };
+
+      // TradingView hard rule: a tick older than the last sent bar throws a
+      // time-order violation and freezes the chart. If data went back in time
+      // (stall, reconnect, store swap), reset the series instead of ticking.
+      if (prevBar && tvBar.time < prevBar.time) {
+        this.lastBarBySubscriber.delete(guid);
+        sub.onResetCache();
+        continue;
+      }
+
       if (!prevBar || prevBar.time !== tvBar.time ||
           prevBar.close !== tvBar.close || prevBar.high !== tvBar.high ||
           prevBar.low !== tvBar.low || prevBar.volume !== tvBar.volume) {

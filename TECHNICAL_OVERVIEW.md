@@ -1,5 +1,7 @@
 # MACKUANT — Technical Overview
 
+> ⚠️ **Document de février 2026, antérieur aux refontes de juin/juillet 2026.** Le moteur de scénarios (entrées pullback, feeder de retest de zones, TP structurels, calibration auto, LLM Risk Desk) et le pipeline de perf ont été largement retravaillés depuis — voir `ALGORITHME_SCENARIOS.md` pour l'état actuel. L'architecture générale décrite ici reste valable.
+
 **Real-Time Bitcoin Order Flow Intelligence Platform**
 
 A full-stack trading intelligence system that connects to 5 cryptocurrency exchanges simultaneously over WebSocket, processes raw trade/orderbook data through 7 signal detectors + multi-timeframe market structure analysis + derivatives tracking, and renders everything through a TradingView Charting Library integration with scored trade scenarios.

@@ -30,8 +30,16 @@ interface TradeScenario {
   createdAt: number;
   expiresAt: number;
   updatedAt: number;
+  activationPrice?: number;
   timeframe: string;
   currentPrice: number;
+  llmVerdict?: {
+    verdict: 'APPROVE' | 'REDUCE' | 'REJECT';
+    confidence: number;
+    bullCase: string;
+    bearCase: string;
+    riskNotes: string;
+  };
 }
 
 interface Props {
@@ -61,6 +69,39 @@ const DIR_COLORS: Record<string, string> = {
   SHORT: '#ef4444',
 };
 
+const VERDICT_COLORS: Record<string, string> = {
+  APPROVE: '#22c55e',
+  REDUCE: '#eab308',
+  REJECT: '#ef4444',
+};
+
+/** Wrap text into lines that fit maxWidth (canvas), capped at maxLines */
+function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number, maxLines: number): string[] {
+  const words = text.split(/\s+/);
+  const lines: string[] = [];
+  let current = '';
+  for (const word of words) {
+    const candidate = current ? `${current} ${word}` : word;
+    if (ctx.measureText(candidate).width <= maxWidth) {
+      current = candidate;
+    } else {
+      if (current) lines.push(current);
+      current = word;
+      if (lines.length === maxLines - 1) {
+        // last allowed line — truncate the rest
+        let rest = current;
+        while (ctx.measureText(rest + '…').width > maxWidth && rest.length > 1) {
+          rest = rest.slice(0, -1);
+        }
+        lines.push(rest + '…');
+        return lines;
+      }
+    }
+  }
+  if (current && lines.length < maxLines) lines.push(current);
+  return lines;
+}
+
 const HEADER_H = 22;
 
 export default function ScenarioPanel({ scenarios }: Props) {
@@ -89,6 +130,14 @@ export default function ScenarioPanel({ scenarios }: Props) {
       sigX += tw + 3;
     }
     h += 12; // signals row
+
+    // Verdict Risk Desk (badge + notes wrappées)
+    if (sc.llmVerdict) {
+      h += 12; // badge line
+      ctx.font = '7px monospace';
+      const noteLines = wrapText(ctx, sc.llmVerdict.riskNotes, W - pad * 2 - 10, 2);
+      h += noteLines.length * 9;
+    }
 
     h += 12; // status + expiration
     h += 14; // invalidation
@@ -249,6 +298,29 @@ export default function ScenarioPanel({ scenarios }: Props) {
       }
       y += 12;
 
+      // Verdict Risk Desk (second avis LLM)
+      if (sc.llmVerdict) {
+        const v = sc.llmVerdict;
+        const vColor = VERDICT_COLORS[v.verdict] || '#6b7280';
+        ctx.font = 'bold 8px monospace';
+        ctx.textAlign = 'left';
+        const badge = `IA ${v.verdict} ${v.confidence}%`;
+        const bw = ctx.measureText(badge).width + 8;
+        ctx.fillStyle = vColor + '22';
+        ctx.fillRect(pad + 6, y + 1, bw, 10);
+        ctx.fillStyle = vColor;
+        ctx.fillText(badge, pad + 10, y + 9);
+        y += 12;
+
+        ctx.font = '7px monospace';
+        ctx.fillStyle = '#9ca3af';
+        const noteLines = wrapText(ctx, v.riskNotes, W - pad * 2 - 10, 2);
+        for (const line of noteLines) {
+          ctx.fillText(line, pad + 6, y + 7);
+          y += 9;
+        }
+      }
+
       // Status + expiration
       const statusColor = STATUS_COLORS[sc.status] || '#6b7280';
       const remainMs = sc.expiresAt - Date.now();
@@ -270,7 +342,9 @@ export default function ScenarioPanel({ scenarios }: Props) {
         ctx.fillStyle = '#4b5563';
         ctx.font = '7px monospace';
         ctx.textAlign = 'left';
-        ctx.fillText(`Invalidation: $${sc.invalidationPrice.toFixed(0)}`, pad + 6, y + 8);
+        // Fill réel affiché dès l'entrée en position — les TP se jugent depuis ce prix
+        const fillInfo = sc.activationPrice ? `Fill: $${sc.activationPrice.toFixed(0)}  ·  ` : '';
+        ctx.fillText(`${fillInfo}Invalidation: $${sc.invalidationPrice.toFixed(0)}`, pad + 6, y + 8);
       } else if (sc.invalidationReason) {
         ctx.fillStyle = '#ef4444';
         ctx.font = '7px monospace';

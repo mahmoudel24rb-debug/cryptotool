@@ -1,5 +1,6 @@
 import { Candle } from '../candles/candleBuilder';
 import { OrderBlock, OrderBlockConfig, StructureBreak, FairValueGap } from './types';
+import { clock } from '../clock';
 
 const MAX_OBS = 50;
 
@@ -70,6 +71,13 @@ export class OrderBlockDetector {
     }
 
     if (!obCandle || obIdx === -1) return null;
+
+    // Dédoublonnage : des cassures rapprochées désignent souvent la même
+    // bougie d'origine → le même OB était créé 2-3 fois (pollue l'inventaire
+    // et le seed historique)
+    if (this.activeOBs.some(o => o.timestamp === obCandle!.time && o.type === (isBullish ? 'BULLISH' : 'BEARISH'))) {
+      return null;
+    }
 
     // Validate displacement: check candles between OB and break
     let hasDisplacement = false;
@@ -148,23 +156,23 @@ export class OrderBlockDetector {
         // Price touches zone = tested
         if (currentPrice <= ob.high && currentPrice >= ob.low && !ob.tested) {
           ob.tested = true;
-          ob.testedAt = Math.floor(Date.now() / 1000);
+          ob.testedAt = Math.floor(clock.now() / 1000);
           ob.strength = Math.max(0, ob.strength - 15); // lose freshness bonus
         }
         // Price closes through entire zone = mitigated
         if (currentClose < ob.low) {
           ob.mitigated = true;
-          ob.mitigatedAt = Math.floor(Date.now() / 1000);
+          ob.mitigatedAt = Math.floor(clock.now() / 1000);
         }
       } else {
         if (currentPrice >= ob.low && currentPrice <= ob.high && !ob.tested) {
           ob.tested = true;
-          ob.testedAt = Math.floor(Date.now() / 1000);
+          ob.testedAt = Math.floor(clock.now() / 1000);
           ob.strength = Math.max(0, ob.strength - 15);
         }
         if (currentClose > ob.high) {
           ob.mitigated = true;
-          ob.mitigatedAt = Math.floor(Date.now() / 1000);
+          ob.mitigatedAt = Math.floor(clock.now() / 1000);
         }
       }
     }
@@ -189,15 +197,21 @@ export class OrderBlockDetector {
 
   private updateATR(candles: Candle[]): void {
     if (candles.length < 2) return;
-    const last = candles[candles.length - 1];
-    const prev = candles[candles.length - 2];
-    const tr = Math.max(
-      last.high - last.low,
-      Math.abs(last.high - prev.close),
-      Math.abs(last.low - prev.close),
-    );
-    this.atrValues.push(tr);
-    if (this.atrValues.length > 28) this.atrValues = this.atrValues.slice(-28);
+    // Recalcul sur les 28 dernières bougies. L'ancien code accumulait UN TR
+    // par appel — or on n'est appelé que sur les cassures, donc l'ATR ne
+    // reflétait que les bougies de displacement (les plus grosses) : le test
+    // `corps > 1.5×ATR` se sabotait lui-même (impossible au 1er appel, rare
+    // ensuite) et la création d'OB était quasi morte, au seed comme en live.
+    this.atrValues = [];
+    const start = Math.max(1, candles.length - 28);
+    for (let i = start; i < candles.length; i++) {
+      const tr = Math.max(
+        candles[i].high - candles[i].low,
+        Math.abs(candles[i].high - candles[i - 1].close),
+        Math.abs(candles[i].low - candles[i - 1].close),
+      );
+      this.atrValues.push(tr);
+    }
   }
 
   private getCurrentATR(): number {

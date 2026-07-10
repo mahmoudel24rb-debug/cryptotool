@@ -13,13 +13,13 @@
     "declarationMap": true,
     "sourceMap": true,
     "outDir": "./dist",
-    "rootDir": "./src",
+    "rootDir": ".",
     "baseUrl": ".",
     "paths": {
       "@server/*": ["src/server/*"],
       "@client/*": ["src/client/*"]
     }
   },
-  "include": ["src/**/*", "public/charting_library/charting_library.d.ts"],
+  "include": ["src/**/*", "scripts/**/*.ts", "public/charting_library/charting_library.d.ts"],
   "exclude": ["node_modules", "dist"]
 }

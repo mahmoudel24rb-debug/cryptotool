@@ -1,0 +1,12 @@
+# Contrôle ce que `railway up` uploade (remplace .gitignore pour l'upload).
+# IMPORTANT : public/charting_library N'EST PAS exclu ici — il est gitignoré
+# (licence TradingView : pas de repo public) mais doit partir sur TON serveur
+# privé pour que le chart fonctionne.
+node_modules/
+dist/
+.git/
+.env
+data/
+logs.md
+*.log
+.claude-memory/

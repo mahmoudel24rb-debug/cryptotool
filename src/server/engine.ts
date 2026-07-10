@@ -27,7 +27,10 @@ import { FundingRateMonitor } from './derivatives/fundingRate';
 import { BasisTracker } from './derivatives/basis';
 import type { DerivativesState } from './derivatives/types';
 import { ConfluenceEngine } from './scenarios/confluenceEngine';
+import { ZoneRetestFeeder, collectMarketLevels } from './scenarios/zoneFeeder';
 import type { ConfluenceSignal } from './scenarios/types';
+import { RiskDesk, buildVerdictTrackRecord, type RiskDeskContext } from './llm/riskDesk';
+import { readFileSync, existsSync } from 'fs';
 
 type BroadcastFn = (type: string, data: unknown) => void;
 type SendToClientFn = (ws: any, type: string, data: unknown) => void;
@@ -89,7 +92,23 @@ export function startEngine(
 ) {
   console.log('[ENGINE] Starting order flow engine...');
 
-  const tradeBuffer = new CircularBuffer<NormalizedTrade>(100000);
+  // Per-exchange recent-trade buffers feed the detectors. A single combined
+  // 100k-trade buffer forced every detector pass to slice + scan ~100k trades
+  // (and churned the GC) — the cost scaled with volume until the event loop
+  // froze. One bounded buffer per exchange keeps each detector input small.
+  const PER_EXCHANGE_BUFFER = 15000;
+  const tradeBuffersByExchange = new Map<string, CircularBuffer<NormalizedTrade>>();
+  function getTradeBuffer(key: string): CircularBuffer<NormalizedTrade> {
+    let b = tradeBuffersByExchange.get(key);
+    if (!b) { b = new CircularBuffer<NormalizedTrade>(PER_EXCHANGE_BUFFER); tradeBuffersByExchange.set(key, b); }
+    return b;
+  }
+  function totalBufferedTrades(): number {
+    let n = 0;
+    for (const b of tradeBuffersByExchange.values()) n += b.length;
+    return n;
+  }
+
   const liquidationBuffer = new CircularBuffer<Liquidation>(10000);
   const orderBooks = new Map<string, OrderBook>();
 
@@ -206,9 +225,9 @@ export function startEngine(
     crossExchangeDivergencePercent: derivConfig.basisDivergencePercent ?? 0.05,
   });
 
-  // Wire derivative alerts
+  // Wire derivative alerts (queued — all alerts go out batched in one WS frame)
   const emitDerivAlert = (type: string, msg: string, details: any) => {
-    broadcast('alert', {
+    queueAlert({
       id: `DERIV-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       type,
       market: 'AGGREGATE',
@@ -217,7 +236,7 @@ export function startEngine(
       timestamp: Date.now(),
       message: msg,
       details,
-    });
+    } as any);
   };
 
   // Start OI and funding pollers
@@ -229,13 +248,12 @@ export function startEngine(
   const confluenceEngine = new ConfluenceEngine({
     weights: conflConfig.weights || undefined,
     minScoreForScenario: conflConfig.minScoreForScenario ?? 35,
-    highPriorityThreshold: conflConfig.highPriorityThreshold ?? 60,
+    highPriorityThreshold: conflConfig.highPriorityThreshold ?? 55,
     extremePriorityThreshold: conflConfig.extremePriorityThreshold ?? 75,
-    signalTimeWindowMs: conflConfig.signalTimeWindowMs ?? 300000,
     scenarioExpirationMs: conflConfig.scenarioExpirationMs ?? 1800000,
-    maxActiveScenarios: conflConfig.maxActiveScenarios ?? 3,
+    maxActiveScenarios: conflConfig.maxActiveScenarios ?? 4,
     minRiskReward: conflConfig.minRiskReward ?? 1.5,
-    slBufferPercent: conflConfig.slBufferPercent ?? 0.15,
+    slBufferPercent: conflConfig.slBufferPercent ?? 0.25,
   });
 
   // Phase 1.1: Inject TrendAnalyzer into ConfluenceEngine
@@ -254,10 +272,61 @@ export function startEngine(
   process.on('SIGTERM', gracefulShutdown);
   process.on('SIGINT', gracefulShutdown);
 
+  // ── LLM Risk Desk: second avis sur les scénarios (pattern TradingAgents) ──
+  const riskDesk = new RiskDesk(config.llm || {});
+  let lastDerivState: any = null; // capturé par l'intervalle de broadcast dérivés
+
+  function buildRiskDeskContext(): RiskDeskContext {
+    const structure: RiskDeskContext['structure'] = {};
+    for (const [tf, analyzer] of structureAnalyzers.entries()) {
+      const state = analyzer.getState();
+      structure[tf] = { trend: state.trend, lastBOS: state.lastBOS, lastCHoCH: state.lastCHoCH };
+    }
+    const vwapData = vwapCalculator.getData();
+    return {
+      currentPrice: confluenceEngine.getCurrentPrice(),
+      trend: trendAnalyzer.analyze(),
+      derivatives: lastDerivState ? {
+        avgFundingRate: lastDerivState.avgFundingRate,
+        aggregateOIChangePct: lastDerivState.aggregateOIChangePct,
+        avgBasisPercent: lastDerivState.avgBasisPercent,
+        cascadeRisk: lastDerivState.cascadeRisk,
+      } : null,
+      structure,
+      vwap: vwapData.vwap > 0 ? {
+        vwap: vwapData.vwap,
+        upperBand2: vwapData.upperBand2,
+        lowerBand2: vwapData.lowerBand2,
+      } : null,
+    };
+  }
+
   confluenceEngine.onScenario((event, scenario) => {
     broadcast(event, scenario);
-    // Save state immediately on any scenario change
-    confluenceEngine.saveState();
+    // State persistence is handled by the engine's dirty-flag periodic saver —
+    // a synchronous write per event used to stall the event loop during big moves
+
+    // Review LLM asynchrone des nouveaux scénarios — n'ajoute aucune latence
+    // au moteur : le verdict arrive quelques secondes plus tard via
+    // applyLlmVerdict, qui re-broadcaste un scenario:update
+    if (event === 'scenario:new' && riskDesk.shouldReview(scenario)) {
+      const context = buildRiskDeskContext();
+      context.templateStats = confluenceEngine.getTemplateStatsFor(scenario.templateId);
+      // Boucle de feedback : l'IA voit les résultats réels de ses derniers
+      // verdicts (30 derniers trades clôturés) pour s'auto-calibrer
+      try {
+        const logPath = './data/scenario_outcomes.jsonl';
+        if (existsSync(logPath)) {
+          const lines = readFileSync(logPath, 'utf-8').trim().split('\n').filter(Boolean).slice(-30);
+          context.verdictTrackRecord = buildVerdictTrackRecord(
+            lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean) as any[],
+          );
+        }
+      } catch { /* le feedback est optionnel — jamais bloquant */ }
+      void riskDesk.review(scenario, context).then(verdict => {
+        if (verdict) confluenceEngine.applyLlmVerdict(scenario.id, verdict, riskDesk.vetoOnReject, riskDesk.observerMode);
+      });
+    }
   });
 
   // Helper: feed a signal into the confluence engine
@@ -274,7 +343,7 @@ export function startEngine(
         : alert.oiChangePercent > 0 && alert.priceChangePercent < 0 ? 'SHORT'
         : alert.oiChangePercent < 0 && alert.priceChangePercent > 0 ? 'LONG' // short squeeze
         : 'SHORT', // long squeeze
-      price: confluenceEngine['currentPrice'] || 0,
+      price: confluenceEngine.getCurrentPrice() || 0,
       timestamp: Date.now(),
       details: { description: alert.interpretation },
     });
@@ -285,7 +354,7 @@ export function startEngine(
     feedConfluence({
       type: 'FUNDING_EXTREME',
       direction: alert.currentRate > 0 ? 'SHORT' : 'LONG', // high funding = bearish, negative = bullish
-      price: confluenceEngine['currentPrice'] || 0,
+      price: confluenceEngine.getCurrentPrice() || 0,
       timestamp: Date.now(),
       details: { description: alert.interpretation },
     });
@@ -296,7 +365,7 @@ export function startEngine(
     feedConfluence({
       type: 'BASIS_EXTREME',
       direction: alert.exchanges?.[0]?.basisPercent > 0 ? 'SHORT' : 'LONG',
-      price: confluenceEngine['currentPrice'] || 0,
+      price: confluenceEngine.getCurrentPrice() || 0,
       timestamp: Date.now(),
       details: { description: alert.description },
     });
@@ -437,7 +506,9 @@ export function startEngine(
               price: (ob.low + ob.high) / 2,
               zoneLow: ob.low,
               zoneHigh: ob.high,
-              strength: ob.strength / 5,
+              // ob.strength est sur 0-100 — l'ancien /5 envoyait des forces
+              // jusqu'à 20 dans un scoring qui attend 0-1
+              strength: Math.min(1, ob.strength / 100),
               timeframe: tf,
               timestamp: Date.now(),
               details: { description: `${ob.type} OB $${ob.low.toFixed(0)}-$${ob.high.toFixed(0)}` },
@@ -455,10 +526,12 @@ export function startEngine(
   }, 500);
 
   // Handle incoming trades
-  // Throttle detector execution: max 20x/sec to avoid CPU saturation during big moves
   let lastDetectorRun = 0;
-  let lastDetectorTrade: NormalizedTrade | null = null;
-  const DETECTOR_MIN_INTERVAL_MS = 50; // 20 Hz max
+  // 5 Hz is ample for microstructure detectors. At 20 Hz, the full detector
+  // sweep (each detector re-scanning the whole trade buffer) ran so often it
+  // saturated the event loop during sustained NY-session volume.
+  const DETECTOR_MIN_INTERVAL_MS = 200;
+  const DETECTOR_WINDOW_MS = 120_000;
 
   // Robust direction extraction from alert details (not message strings)
   function getAlertDirection(alert: Alert): 'LONG' | 'SHORT' {
@@ -472,7 +545,11 @@ export function startEngine(
       case 'VELOCITY':
         return d?.cvdShift > 0 ? 'LONG' : 'SHORT';
       case 'EXHAUSTION':
-        return d?.priceDropUsd > 0 ? 'LONG' : 'SHORT';
+        // Explicit field — the old `priceDropUsd > 0` check only worked by
+        // accident (the bearish case has no priceDropUsd → undefined > 0 → SHORT)
+        return d?.impliedDirection === 'LONG' ? 'LONG'
+          : d?.impliedDirection === 'SHORT' ? 'SHORT'
+          : d?.priceDropUsd > 0 ? 'LONG' : 'SHORT';
       case 'DIVERGENCE':
         return d?.cvd > 0 ? 'LONG' : 'SHORT';
       case 'TWAP':
@@ -484,7 +561,8 @@ export function startEngine(
     }
   }
 
-  // Throttle alert broadcasts: batch alerts and send max 5x/sec
+  // Throttle alert broadcasts: batch alerts and send as ONE WS frame max 5x/sec.
+  // One frame per alert used to flood every client during big moves (render storms).
   let alertQueue: Alert[] = [];
   let alertFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -492,9 +570,7 @@ export function startEngine(
     alertFlushTimer = null;
     if (alertQueue.length === 0) return;
     const batch = alertQueue.splice(0, alertQueue.length);
-    for (const alert of batch) {
-      broadcast('alert', alert);
-    }
+    broadcast('alert_batch', batch);
   }
 
   function queueAlert(alert: Alert) {
@@ -528,7 +604,16 @@ export function startEngine(
       const alert = detectors.liquidation.detect(liqs, liq);
       if (alert) {
         trendAnalyzer.onAlert(alert);
-        broadcast('alert', alert);
+        queueAlert(alert);
+        // Was never fed to confluence — the "Cascade de Liquidation" template could not match
+        feedConfluence({
+          type: 'LIQUIDATION',
+          direction: getAlertDirection(alert),
+          price: liq.price,
+          timestamp: Date.now(),
+          strength: (alert as any).details?.strength,
+          details: { description: (alert as any).message || 'LIQUIDATION' },
+        });
       }
     }
   }
@@ -690,6 +775,82 @@ export function startEngine(
       console.log(`[CANDLES] Loaded ${bybitCandles.size} historical candles for BYBIT:PERP`);
     }
 
+    // Coinbase spot: paginated fetch (API limit 300/page) — without history
+    // this chart started empty and looked "lagging" vs the seeded exchanges
+    try {
+      const cbCandles = new Map<number, Candle>();
+      let cbEnd = Math.floor(Date.now() / 1000);
+      for (let page = 0; page < 5; page++) {
+        const cbStart = cbEnd - 300 * 60;
+        const url = `https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60&start=${cbStart}&end=${cbEnd}`;
+        const res = await fetch(url);
+        if (!res.ok) { console.log(`[CANDLES] Coinbase page ${page} failed: ${res.status}`); break; }
+        const json = await res.json();
+        if (!Array.isArray(json) || json.length === 0) break;
+        // Format: [time, low, high, open, close, volume(BTC)], newest first
+        for (const k of json) {
+          const time = Number(k[0]);
+          const close = Number(k[4]);
+          cbCandles.set(time, {
+            time,
+            open: Number(k[3]),
+            high: Number(k[2]),
+            low: Number(k[1]),
+            close,
+            volume: Number(k[5]) * close, // BTC volume → approx USD
+          });
+        }
+        cbEnd = cbStart;
+      }
+      if (cbCandles.size > 0) {
+        candlesByExchange.set('COINBASE:SPOT', cbCandles);
+        sortedCandleArrays.set('COINBASE:SPOT', Array.from(cbCandles.values()).sort((a, b) => a.time - b.time));
+        console.log(`[CANDLES] Loaded ${cbCandles.size} historical candles for COINBASE:SPOT`);
+      }
+    } catch (err: any) {
+      console.log(`[CANDLES] Error fetching COINBASE:SPOT: ${err.message}`);
+    }
+
+    // Hyperliquid perp: candleSnapshot via info API
+    try {
+      const hlStart = Date.now() - 4500 * 60_000;
+      const res = await fetch('https://api.hyperliquid.xyz/info', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'candleSnapshot',
+          req: { coin: 'BTC', interval: '1m', startTime: hlStart, endTime: Date.now() },
+        }),
+      });
+      if (res.ok) {
+        const json = await res.json();
+        const hlCandles = new Map<number, Candle>();
+        if (Array.isArray(json)) {
+          for (const k of json) {
+            const time = Math.floor(Number(k.t) / 1000);
+            const close = Number(k.c);
+            hlCandles.set(time, {
+              time,
+              open: Number(k.o),
+              high: Number(k.h),
+              low: Number(k.l),
+              close,
+              volume: Number(k.v) * close, // BTC volume → approx USD
+            });
+          }
+        }
+        if (hlCandles.size > 0) {
+          candlesByExchange.set('HYPERLIQUID:PERP', hlCandles);
+          sortedCandleArrays.set('HYPERLIQUID:PERP', Array.from(hlCandles.values()).sort((a, b) => a.time - b.time));
+          console.log(`[CANDLES] Loaded ${hlCandles.size} historical candles for HYPERLIQUID:PERP`);
+        }
+      } else {
+        console.log(`[CANDLES] Hyperliquid candleSnapshot failed: ${res.status}`);
+      }
+    } catch (err: any) {
+      console.log(`[CANDLES] Error fetching HYPERLIQUID:PERP: ${err.message}`);
+    }
+
     // OKX: single fetch (API limit 300)
     try {
       const res = await fetch('https://www.okx.com/api/v5/market/candles?instId=BTC-USDT-SWAP&bar=1m&limit=300');
@@ -820,6 +981,38 @@ export function startEngine(
         }
       }
 
+      // Seed Order Blocks depuis les cassures historiques — les FVG et pools
+      // étaient reconstruits au boot mais PAS les OB : l'inventaire partait
+      // vide à chaque (re)démarrage et le feeder OB_RETEST n'avait rien à
+      // surveiller pendant des heures. Rejoue chronologiquement : cassure →
+      // création d'OB avec l'historique jusqu'à ce point, puis cycle de vie
+      // bougie par bougie (tested/mitigated) avec les bougies suivantes.
+      for (const [tf, analyzer] of structureAnalyzers.entries()) {
+        const obDetector = obDetectors.get(tf);
+        const fvgDetector = fvgDetectors.get(tf);
+        if (!obDetector) continue;
+        const tfCandles = candleBuilder.getCandles(tf);
+        if (tfCandles.length < 10) continue;
+
+        const state = analyzer.getState();
+        // recentBreaks est du plus récent au plus ancien → remettre en ordre chronologique
+        const breaksAsc = [...state.recentBreaks].sort((a, b) => a.timestamp - b.timestamp);
+        let brkIdx = 0;
+        for (let i = 0; i < tfCandles.length; i++) {
+          const c = tfCandles[i];
+          while (brkIdx < breaksAsc.length && breaksAsc[brkIdx].timestamp === c.time) {
+            obDetector.onStructureBreak(
+              breaksAsc[brkIdx],
+              tfCandles.slice(0, i + 1),
+              fvgDetector ? fvgDetector.getActiveFVGs() : [],
+            );
+            brkIdx++;
+          }
+          obDetector.updateLifecycle(c.close, c.close);
+        }
+        console.log(`[PHASE-B] ${tf} Order Blocks seedés: ${obDetector.getActiveOBs().length} actifs`);
+      }
+
       // Seed Volume Profile
       volumeProfile.seedFromCandles(enriched);
       const vpData = volumeProfile.getData();
@@ -881,6 +1074,25 @@ export function startEngine(
       last.delta += delta;
       last.cumulative = (cvdEntries.length > 1 ? cvdEntries[cvdEntries.length - 2].cumulative : 0) + last.delta;
       cvdCumulative = last.cumulative;
+    } else if (last && minuteTs < last.time) {
+      // Late trade for an earlier minute (cross-exchange skew, and the Binance
+      // REST fallback delivers up to ~2s late at every minute boundary).
+      // Blindly pushing created out-of-order entries and corrupted cumulatives.
+      // Walk back a few buckets (late trades are never far), add the delta
+      // there, and re-accumulate forward from that point.
+      for (let i = cvdEntries.length - 1; i >= 0 && i >= cvdEntries.length - 5; i--) {
+        if (cvdEntries[i].time === minuteTs) {
+          cvdEntries[i].delta += delta;
+          let cum = i > 0 ? cvdEntries[i - 1].cumulative : 0;
+          for (let j = i; j < cvdEntries.length; j++) {
+            cum += cvdEntries[j].delta;
+            cvdEntries[j].cumulative = cum;
+          }
+          cvdCumulative = cum;
+          return;
+        }
+      }
+      // Older than our recent window — too stale to matter, drop it
     } else {
       cvdCumulative += delta;
       cvdEntries.push({ time: minuteTs, delta, cumulative: cvdCumulative });
@@ -898,6 +1110,12 @@ export function startEngine(
     }
   }
 
+  /** O(1) tip accessor — getCvdSeries() allocated a 4500-object array every 500ms just for the last point */
+  function getCvdTip(): { time: number; value: number } | null {
+    const last = cvdEntries[cvdEntries.length - 1];
+    return last ? { time: last.time, value: last.cumulative } : null;
+  }
+
   function getCvdSeries(): { time: number; value: number }[] {
     return cvdEntries.map(e => ({ time: e.time, value: e.cumulative }));
   }
@@ -907,8 +1125,28 @@ export function startEngine(
   const tradeBatch: NormalizedTrade[] = [];
   const BATCH_INTERVAL_MS = 100; // 10 Hz processing
 
+  // Backpressure caps so a volume spike (NY open) can never block the event
+  // loop for seconds: process at most N trades per 100ms drain (≈15k/s
+  // capacity), carry the rest to the next tick; and never let the pending
+  // buffer grow unbounded — drop the oldest overflow (degrade, don't freeze).
+  const MAX_TRADES_PER_DRAIN = 1500;
+  const MAX_PENDING_BATCH = 20000;
+  let perfDroppedTrades = 0;
+  let perfMaxDetectMs = 0;
+  // Per-exchange freshness: trade count this interval + last trade timestamp,
+  // so a frozen/stale feed is obvious at a glance in the [FEEDS] line.
+  // restCount tracks REST-fallback trades so a dead WS can't masquerade as fresh.
+  const feedStats = new Map<string, { count: number; restCount: number; lastTs: number }>();
+
   // Wire up the ingestion function now that tradeBatch exists
-  tradeIngestionFn = (trade: NormalizedTrade) => { tradeBatch.push(trade); };
+  tradeIngestionFn = (trade: NormalizedTrade) => {
+    tradeBatch.push(trade);
+    if (tradeBatch.length > MAX_PENDING_BATCH) {
+      const overflow = tradeBatch.length - MAX_PENDING_BATCH;
+      tradeBatch.splice(0, overflow);
+      perfDroppedTrades += overflow;
+    }
+  };
 
   // ── Performance monitoring ──
   let perfTradesTotal = 0;
@@ -929,17 +1167,37 @@ export function startEngine(
   setInterval(() => {
     const tradesPerSec = Math.round(perfTradesTotal / 10);
     if (tradesPerSec > 0 || perfEventLoopLag > 50) {
+      const heapMb = Math.round(process.memoryUsage().heapUsed / 1048576);
+      // pending = real backlog of unprocessed trades (the number to watch).
+      // window = rolling per-exchange detector input (fills by design, not a backlog).
       console.log(
         `[PERF] ${tradesPerSec} trades/sec | ` +
         `batches: ${perfBatchCount} (max size: ${perfMaxBatchSize}, max time: ${perfMaxBatchMs}ms) | ` +
-        `event loop lag: ${perfEventLoopLag}ms | ` +
-        `trade buffer: ${tradeBuffer.length}`
+        `detect: ${perfMaxDetectMs}ms | loop lag: ${perfEventLoopLag}ms | ` +
+        `heap: ${heapMb}MB | window: ${totalBufferedTrades()} | pending: ${tradeBatch.length}` +
+        (perfDroppedTrades > 0 ? ` | DROPPED: ${perfDroppedTrades}` : '')
       );
+
+      // Per-exchange feed health — a stale feed (no trades, rising age) jumps out
+      const nowTs = Date.now();
+      const parts: string[] = [];
+      for (const [key, fs] of feedStats) {
+        const ageS = fs.lastTs > 0 ? Math.round((nowTs - fs.lastTs) / 1000) : 999;
+        const stale = ageS > 30 ? ' STALE' : '';
+        // Majority REST = the WS is actually dead, don't let the poll fake freshness
+        const rest = fs.count > 0 && fs.restCount > fs.count / 2 ? ' REST' : '';
+        parts.push(`${key} ${fs.count} (${ageS}s${stale}${rest})`);
+        fs.count = 0;
+        fs.restCount = 0;
+      }
+      if (parts.length > 0) console.log(`[FEEDS] ${parts.join(' | ')}`);
     }
     perfTradesTotal = 0;
     perfBatchCount = 0;
     perfMaxBatchSize = 0;
     perfMaxBatchMs = 0;
+    perfDroppedTrades = 0;
+    perfMaxDetectMs = 0;
   }, 10000);
 
   // Process batched trades every 100ms — chunked async to yield event loop during big moves
@@ -953,8 +1211,11 @@ export function startEngine(
     try {
     const batchStart = Date.now();
 
-    // Drain the batch
-    const batch = tradeBatch.splice(0, tradeBatch.length);
+    // Drain up to the per-tick cap — leftover stays for the next 100ms tick.
+    // Bounding the drain keeps each pass short so the 500ms candle_tick and
+    // other broadcasts always get a turn, even during a NY-open spike.
+    const drainCount = Math.min(tradeBatch.length, MAX_TRADES_PER_DRAIN);
+    const batch = tradeBatch.splice(0, drainCount);
     perfTradesTotal += batch.length;
     perfBatchCount++;
     if (batch.length > perfMaxBatchSize) perfMaxBatchSize = batch.length;
@@ -967,8 +1228,15 @@ export function startEngine(
         updateCandle(trade);
         updateHTFCandle(trade);
         updateCvd(trade);
-        tradeBuffer.push(trade);
+        const exKey = `${trade.exchange}:${trade.market}`;
+        getTradeBuffer(exKey).push(trade);
         metrics.onTrade(trade);
+        // Per-exchange freshness tracking (cheap O(1))
+        let fs = feedStats.get(exKey);
+        if (!fs) { fs = { count: 0, restCount: 0, lastTs: 0 }; feedStats.set(exKey, fs); }
+        fs.count++;
+        if (trade.source === 'REST') fs.restCount++;
+        fs.lastTs = trade.timestamp;
       }
 
       for (const trade of chunk) {
@@ -1005,7 +1273,11 @@ export function startEngine(
     const now = Date.now();
     if (now - lastDetectorRun >= DETECTOR_MIN_INTERVAL_MS) {
       lastDetectorRun = now;
-      const recentTrades = tradeBuffer.getRecent(120000);
+      const detectStart = Date.now();
+      // The per-exchange buffer is already small and scoped to one exchange —
+      // no giant slice, no prefilter. getRecent returns ≤15k trades.
+      const exKey = `${lastTrade.exchange}:${lastTrade.market}`;
+      const recentTrades = getTradeBuffer(exKey).getRecent(DETECTOR_WINDOW_MS);
       const alerts: Alert[] = [];
 
       if (config.detectors.absorption.enabled) {
@@ -1046,6 +1318,9 @@ export function startEngine(
           details: { description: (alert as any).message || alert.type },
         });
       }
+
+      const detectMs = Date.now() - detectStart;
+      if (detectMs > perfMaxDetectMs) perfMaxDetectMs = detectMs;
     }
     } finally {
       drainInProgress = false;
@@ -1079,6 +1354,11 @@ export function startEngine(
           volume: trade.usdValue,
         };
         candles.set(bucketTime, candle);
+        // Prune: these maps grew unbounded (slow leak over long uptimes)
+        if (candles.size > 600) {
+          const times = Array.from(candles.keys()).sort((a, b) => a - b);
+          for (let i = 0; i < times.length - 550; i++) candles.delete(times[i]);
+        }
       } else {
         candle.high = Math.max(candle.high, trade.price);
         candle.low = Math.min(candle.low, trade.price);
@@ -1088,19 +1368,15 @@ export function startEngine(
     }
   }
 
-  // Fetch historical 1h and 4h candles from Binance Futures
+  // Fetch historical 1h and 4h candles — Binance Futures ET Bybit (le chart
+  // par défaut) : sans ça, le chart Bybit restait coupé à ~3 jours même
+  // dézoomé, pendant que Binance affichait des semaines en 1h/4h
   async function fetchHTFHistoricalCandles() {
-    const htfSources = [
-      {
-        key: 'BINANCE_FUTURES:PERP',
-        tf: '1h',
-        url: 'https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=500',
-      },
-      {
-        key: 'BINANCE_FUTURES:PERP',
-        tf: '4h',
-        url: 'https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=4h&limit=500',
-      },
+    const htfSources: Array<{ key: string; tf: string; url: string; kind: 'binance' | 'bybit' }> = [
+      { key: 'BINANCE_FUTURES:PERP', tf: '1h', kind: 'binance', url: 'https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=500' },
+      { key: 'BINANCE_FUTURES:PERP', tf: '4h', kind: 'binance', url: 'https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=4h&limit=500' },
+      { key: 'BYBIT:PERP', tf: '1h', kind: 'bybit', url: 'https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=60&limit=1000' },
+      { key: 'BYBIT:PERP', tf: '4h', kind: 'bybit', url: 'https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=240&limit=1000' },
     ];
 
     for (const src of htfSources) {
@@ -1111,7 +1387,7 @@ export function startEngine(
         const htfKey = `${src.key}:${src.tf}`;
         const candles = new Map<number, Candle>();
 
-        if (Array.isArray(json)) {
+        if (src.kind === 'binance' && Array.isArray(json)) {
           for (const k of json) {
             const time = Math.floor(k[0] / 1000);
             candles.set(time, {
@@ -1120,7 +1396,20 @@ export function startEngine(
               high: parseFloat(k[2]),
               low: parseFloat(k[3]),
               close: parseFloat(k[4]),
-              volume: parseFloat(k[7]),
+              volume: parseFloat(k[7]), // quote volume (USD)
+            });
+          }
+        } else if (src.kind === 'bybit' && Array.isArray(json?.result?.list)) {
+          // Bybit v5 kline : [start(ms), open, high, low, close, volume(base), turnover(quote)]
+          for (const k of json.result.list) {
+            const time = Math.floor(Number(k[0]) / 1000);
+            candles.set(time, {
+              time,
+              open: parseFloat(k[1]),
+              high: parseFloat(k[2]),
+              low: parseFloat(k[3]),
+              close: parseFloat(k[4]),
+              volume: parseFloat(k[6]) || parseFloat(k[5]), // turnover USD
             });
           }
         }
@@ -1205,44 +1494,58 @@ export function startEngine(
     }
     broadcast('candle_tick', payload);
 
-    // CVD tip: just the last point
-    const cvdSeries = getCvdSeries();
-    if (cvdSeries.length > 0) {
-      broadcast('cvd_tick', cvdSeries[cvdSeries.length - 1]);
+    // CVD tip: just the last point (O(1), no full-series allocation)
+    const cvdTip = getCvdTip();
+    if (cvdTip) {
+      broadcast('cvd_tick', cvdTip);
     }
   }, 500);
 
   // ── Phase A Broadcasts ──
 
-  // Broadcast VWAP every 1 second + feed VWAP context to confluence
+  // Broadcast VWAP every 1 second + feed VWAP context to confluence.
+  // Context signals are throttled to one per 2 min — emitting them every second
+  // during extended moves created a permanent mean-reversion bias (knife catching).
+  const CONTEXT_SIGNAL_COOLDOWN_MS = 120_000;
+  let lastVwapSignalAt = 0;
   setInterval(() => {
     const vwapData = vwapCalculator.getData();
     if (vwapData.vwap > 0) {
       broadcast('vwap', vwapData);
 
       // Phase D: VWAP position context (only emit if price is extended)
-      const price = confluenceEngine['currentPrice'];
-      if (price > 0 && vwapData.lowerBand2 > 0 && vwapData.upperBand2 > 0) {
+      const price = confluenceEngine.getCurrentPrice();
+      const now = Date.now();
+      if (price > 0 && vwapData.lowerBand2 > 0 && vwapData.upperBand2 > 0 &&
+          now - lastVwapSignalAt >= CONTEXT_SIGNAL_COOLDOWN_MS) {
         if (price <= vwapData.lowerBand2) {
+          lastVwapSignalAt = now;
           feedConfluence({
             type: 'VWAP_POSITION',
             direction: 'LONG',
             price,
-            timestamp: Date.now(),
+            timestamp: now,
             details: { description: `Price at VWAP -2σ ($${vwapData.lowerBand2.toFixed(0)}) — oversold` },
           });
         } else if (price >= vwapData.upperBand2) {
+          lastVwapSignalAt = now;
           feedConfluence({
             type: 'VWAP_POSITION',
             direction: 'SHORT',
             price,
-            timestamp: Date.now(),
+            timestamp: now,
             details: { description: `Price at VWAP +2σ ($${vwapData.upperBand2.toFixed(0)}) — overbought` },
           });
         }
       }
     }
   }, 1000);
+
+  // ── Refonte v2: zone-retest signals + structural TP levels ──
+  // Implémentation partagée avec le backtest (src/server/scenarios/zoneFeeder.ts)
+  // — ce qui est backtesté est exactement ce qui tourne en live.
+  const zoneRetestFeeder = new ZoneRetestFeeder(obDetectors, fvgDetectors, feedConfluence);
+  let lastVpData: { poc: number; vah: number; val: number } | null = null;
 
   // Broadcast market structure state every 2 seconds (includes Phase B zones)
   setInterval(() => {
@@ -1268,24 +1571,36 @@ export function startEngine(
       };
     }
     broadcast('structure', structureState);
+
+    // Refonte v2: retest signals + structural TP levels
+    const price = confluenceEngine.getCurrentPrice();
+    if (price > 0) {
+      zoneRetestFeeder.check(price);
+      confluenceEngine.updateMarketLevels(collectMarketLevels(structureAnalyzers, liqDetectors, lastVpData));
+    }
   }, 2000);
 
   // Broadcast Volume Profile every 3 seconds + POC context for confluence
+  let lastPocSignalAt = 0;
   setInterval(() => {
     const vpData = volumeProfile.getData();
     if (vpData.poc > 0) {
       broadcast('volumeProfile', vpData);
 
-      // Phase D: POC proximity context
-      const price = confluenceEngine['currentPrice'];
-      if (price > 0) {
+      lastVpData = { poc: vpData.poc, vah: vpData.vah, val: vpData.val };
+
+      // Phase D: POC proximity context (throttled like VWAP context)
+      const price = confluenceEngine.getCurrentPrice();
+      const now = Date.now();
+      if (price > 0 && now - lastPocSignalAt >= CONTEXT_SIGNAL_COOLDOWN_MS) {
         const pocDist = Math.abs(price - vpData.poc) / vpData.poc;
         if (pocDist < 0.001) { // within 0.1% of POC
+          lastPocSignalAt = now;
           feedConfluence({
             type: 'VOLUME_PROFILE',
             direction: price > vpData.poc ? 'SHORT' : 'LONG', // rejection at POC
             price,
-            timestamp: Date.now(),
+            timestamp: now,
             details: { description: `Price at POC $${vpData.poc.toFixed(0)}` },
           });
         }
@@ -1340,19 +1655,24 @@ export function startEngine(
       lastUpdate: Date.now(),
     };
 
+    lastDerivState = derivState; // contexte pour le Risk Desk
     broadcast('derivatives', derivState);
   }, 10000);
 
-  // ── Phase D: Scenario lifecycle tick + broadcast every 5 seconds ──
+  // ── Phase D: Scenario lifecycle tick every 1s (SL/TP checks were too
+  // coarse at 5s during fast moves), full list broadcast every 5s
+  // (individual scenario events are already pushed in real time) ──
   setInterval(() => {
     confluenceEngine.tick();
-    const scenarios = confluenceEngine.getActiveScenarios();
-    broadcast('scenarios', scenarios);
+  }, 1000);
+
+  setInterval(() => {
+    broadcast('scenarios', confluenceEngine.getActiveScenarios());
   }, 5000);
 
   console.log(`[ENGINE] Started with ${connectors.length} exchange connector(s)`);
   console.log(`[ENGINE] Phase A active: Structure analysis (${[...structureAnalyzers.keys()].join(', ')}) + VWAP`);
   console.log(`[ENGINE] Phase B active: Order Blocks, FVGs, Liquidity, Volume Profile`);
   console.log(`[ENGINE] Phase C active: Open Interest, Funding Rate, Basis/Premium`);
-  console.log(`[ENGINE] Phase D active: Confluence Engine (10 templates, max ${confluenceEngine.getActiveScenarios().length}/${conflConfig.maxActiveScenarios ?? 3} scenarios)`);
+  console.log(`[ENGINE] Phase D active: Confluence Engine (12 templates, max ${conflConfig.maxActiveScenarios ?? 4} concurrent scenarios, zone-retest feeder ON)`);
 }

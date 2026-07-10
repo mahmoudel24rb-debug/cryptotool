@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useActiveTab, type TabId } from './hooks/useActiveTab';
 import { GlobalContext, type Alert, type MetricsData, type GlobalState, type GlobalActions, type GlobalContextValue } from './hooks/useGlobalState';
@@ -11,10 +11,12 @@ import DerivativesTab from './components/tabs/DerivativesTab';
 import VolumeProfileTab from './components/tabs/VolumeProfileTab';
 import ToolsTab from './components/tabs/ToolsTab';
 
-// In production (Docker), WS runs on same port as the HTTP server
-// In dev, Vite serves on :5173 but WS server runs on :3001
-const WS_PORT = import.meta.env.PROD ? window.location.port || '3000' : '3001';
-const WS_URL = `ws://${window.location.hostname}:${WS_PORT}/ws`;
+// Prod : même origine que la page (Railway = HTTPS sans port → wss://host/ws).
+// L'ancien code forçait ws:// et le port 3000 — connexion impossible derrière
+// un proxy HTTPS. Dev : Vite sur :5173, serveur WS sur :4242.
+const WS_URL = import.meta.env.PROD
+  ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`
+  : `ws://${window.location.hostname}:4242/ws`;
 
 export default function App() {
   const { connected, subscribe } = useWebSocket(WS_URL);
@@ -68,51 +70,79 @@ export default function App() {
 
   // ── WebSocket subscriptions (always active) ──
 
-  // Alerts
+  // Alerts — the server sends batches ('alert_batch', one WS frame per 200ms).
+  // Alerts are buffered in a ref and flushed to React at 2 Hz: during big moves
+  // the old per-alert setState caused a re-render storm of the whole app.
+  const pendingAlertsRef = useRef<Alert[]>([]);
+  const pendingUnreadRef = useRef({ orderflow: 0, structure: 0, derivatives: 0 });
+
   useEffect(() => {
-    const unsub = subscribe('alert', (msg) => {
-      const alert = msg.data as Alert;
-      setAlerts(prev => [alert, ...prev].slice(0, 200));
+    const MAX_TOASTS_PER_BATCH = 3;
 
-      if (alert.type === 'SPIKE') {
-        setLastSpike(`[${alert.exchange}:${alert.symbol}] ${alert.message}`);
-      }
+    const processIncoming = (incoming: Alert[]) => {
+      let toastCount = 0;
+      for (const alert of incoming) {
+        pendingAlertsRef.current.push(alert);
+        pendingUnreadRef.current.orderflow++;
 
-      // Increment unread for relevant tabs
-      incrementUnread('orderflow');
+        if (alert.type === 'SPIKE') {
+          setLastSpike(`[${alert.exchange}:${alert.symbol}] ${alert.message}`);
+        }
 
-      // Cross-tab toasts for critical events
-      if (alert.type === 'LIQUIDATION' && alert.details?.volumeUsd > 1_000_000) {
-        pushToast({
-          type: 'LIQUIDATION',
-          message: `$${(alert.details.volumeUsd / 1e6).toFixed(1)}M on ${alert.exchange}`,
-          color: '#ef4444',
-          targetTab: 'orderflow',
-        });
+        // Cross-tab toasts for critical events (capped per batch to avoid spam)
+        if (alert.type === 'LIQUIDATION' && alert.details?.volumeUsd > 1_000_000 && toastCount < MAX_TOASTS_PER_BATCH) {
+          toastCount++;
+          pushToast({
+            type: 'LIQUIDATION',
+            message: `$${(alert.details.volumeUsd / 1e6).toFixed(1)}M on ${alert.exchange}`,
+            color: '#ef4444',
+            targetTab: 'orderflow',
+          });
+        }
+        // Structure alerts (CHoCH)
+        if (alert.message?.includes('CHoCH')) {
+          if (toastCount < MAX_TOASTS_PER_BATCH) {
+            toastCount++;
+            pushToast({ type: 'CHoCH', message: alert.message, color: '#22d3ee', targetTab: 'structure' });
+          }
+          pendingUnreadRef.current.structure++;
+        }
+        // Derivatives alerts
+        if (alert.type === 'OI_SURGE' || alert.type === 'FUNDING_EXTREME' || alert.type === 'BASIS_FLIP') {
+          if (toastCount < MAX_TOASTS_PER_BATCH) {
+            toastCount++;
+            pushToast({ type: alert.type, message: alert.message, color: '#ff6b35', targetTab: 'derivatives' });
+          }
+          pendingUnreadRef.current.derivatives++;
+        }
       }
-      // Structure alerts (CHoCH)
-      if (alert.message?.includes('CHoCH')) {
-        pushToast({
-          type: 'CHoCH',
-          message: alert.message,
-          color: '#22d3ee',
-          targetTab: 'structure',
-        });
-        incrementUnread('structure');
+    };
+
+    const unsubBatch = subscribe('alert_batch', (msg) => processIncoming(msg.data as Alert[]));
+    const unsubSingle = subscribe('alert', (msg) => processIncoming([msg.data as Alert])); // legacy/compat
+
+    // Flush buffered alerts to React state at most 2x/sec
+    const flushTimer = setInterval(() => {
+      const pending = pendingAlertsRef.current;
+      if (pending.length > 0) {
+        pendingAlertsRef.current = [];
+        const newestFirst = pending.slice().reverse();
+        setAlerts(prev => [...newestFirst, ...prev].slice(0, 200));
       }
-      // Derivatives alerts
-      if (alert.type === 'OI_SURGE' || alert.type === 'FUNDING_EXTREME' || alert.type === 'BASIS_FLIP') {
-        pushToast({
-          type: alert.type,
-          message: alert.message,
-          color: '#ff6b35',
-          targetTab: 'derivatives',
-        });
-        incrementUnread('derivatives');
+      const unread = pendingUnreadRef.current;
+      if (unread.orderflow || unread.structure || unread.derivatives) {
+        pendingUnreadRef.current = { orderflow: 0, structure: 0, derivatives: 0 };
+        setUnreadAlerts(prev => ({
+          ...prev,
+          orderflow: prev.orderflow + unread.orderflow,
+          structure: prev.structure + unread.structure,
+          derivatives: prev.derivatives + unread.derivatives,
+        }));
       }
-    });
-    return unsub;
-  }, [subscribe, incrementUnread]);
+    }, 500);
+
+    return () => { unsubBatch(); unsubSingle(); clearInterval(flushTimer); };
+  }, [subscribe]);
 
   // Metrics
   useEffect(() => {
@@ -325,8 +355,19 @@ export default function App() {
     return unsub;
   }, [subscribe]);
 
-  // ── Build GlobalContext value ──
-  const globalState: GlobalState = {
+  // Expiration (missed entry, time stop, TTL) — jamais écouté auparavant :
+  // les cartes disparaissaient sans montrer leur raison de sortie
+  useEffect(() => {
+    const unsub = subscribe('scenario:expired', (msg) => {
+      const exp = msg.data as any;
+      setScenarios(prev => prev.map(s => s.id === exp.id ? exp : s));
+    });
+    return unsub;
+  }, [subscribe]);
+
+  // ── Build GlobalContext value (memoized — a new object identity on every
+  // render forced every context consumer to re-render on unrelated updates) ──
+  const globalState: GlobalState = useMemo(() => ({
     connected,
     currentPrice,
     trend,
@@ -345,9 +386,14 @@ export default function App() {
     lastSpike,
     htfCandles,
     candleTickVersion,
-  };
+  }), [
+    connected, currentPrice, trend, trendScore, alerts, metrics,
+    candlesByExchange, orderBooks, cvdData, vwapData, structureData,
+    volumeProfileData, derivativesData, scenarios, unreadAlerts,
+    lastSpike, htfCandles, candleTickVersion,
+  ]);
 
-  const globalActions: GlobalActions = {
+  const globalActions: GlobalActions = useMemo(() => ({
     setAlerts, setMetrics, setCandlesByExchange, setOrderBooks,
     setCvdData, setVwapData, setStructureData, setVolumeProfileData,
     setDerivativesData, setScenarios, setTrend, setTrendScore,
@@ -355,9 +401,12 @@ export default function App() {
     setConnected: () => {},
     clearUnread,
     incrementUnread,
-  };
+  }), [clearUnread, incrementUnread]);
 
-  const ctxValue: GlobalContextValue = { state: globalState, actions: globalActions, candleStoreRef };
+  const ctxValue: GlobalContextValue = useMemo(
+    () => ({ state: globalState, actions: globalActions, candleStoreRef }),
+    [globalState, globalActions],
+  );
 
   return (
     <GlobalContext.Provider value={ctxValue}>

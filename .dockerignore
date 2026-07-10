@@ -3,3 +3,6 @@ dist
 .git
 *.md
 .env
+data
+logs.md
+.claude-memory

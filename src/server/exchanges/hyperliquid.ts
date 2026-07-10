@@ -25,6 +25,16 @@ export class HyperliquidConnector extends BaseExchangeConnector {
         method: 'subscribe',
         subscription: { type: 'l2Book', coin: 'BTC' },
       }));
+      // Hyperliquid closes any connection whose CLIENT sent nothing for 60s —
+      // without this app-level ping the feed died and reconnected in a loop
+      const hlPing = setInterval(() => {
+        if (ws.readyState === 1) {
+          ws.send(JSON.stringify({ method: 'ping' }));
+        } else {
+          clearInterval(hlPing);
+        }
+      }, 30_000);
+      ws.on('close', () => clearInterval(hlPing));
     }, (data) => {
       if (data.channel === 'trades') {
         this.handleTrades(data);

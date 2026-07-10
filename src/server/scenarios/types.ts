@@ -19,14 +19,13 @@ export interface ConfluenceConfig {
     vwapPosition: number;     // Price discount/premium to VWAP (default: 5)
     volumeProfile: number;    // Price at POC/VAH/VAL (default: 5)
   };
-  minScoreForScenario: number;    // default: 30
+  minScoreForScenario: number;    // default: 35
   highPriorityThreshold: number;  // default: 55
   extremePriorityThreshold: number; // default: 75
-  signalTimeWindowMs: number;     // default: 300000 (5 min)
   scenarioExpirationMs: number;   // default: 1800000 (30 min)
-  maxActiveScenarios: number;     // default: 5
-  minRiskReward: number;          // default: 1.5
-  slBufferPercent: number;        // default: 0.1
+  maxActiveScenarios: number;     // default: 4
+  minRiskReward: number;          // R:R minimum vers TP2 (cappé sur niveaux) — default: 1.2
+  slBufferPercent: number;        // fallback si ATR indisponible — default: 0.25 (%)
 }
 
 export type ScenarioDirection = 'LONG' | 'SHORT';
@@ -62,7 +61,8 @@ export interface TradeScenario {
   // Zones
   entryLow: number;
   entryHigh: number;
-  stopLoss: number;
+  stopLoss: number;           // mute avec le trailing (breakeven après TP1, TP1 après TP2)
+  initialStopLoss?: number;   // SL d'origine — sert au calcul du risque (R)
   tp1: number;
   tp2: number;
   tp3: number;
@@ -79,6 +79,8 @@ export interface TradeScenario {
   createdAt: number;
   expiresAt: number;
   updatedAt: number;
+  activatedAt?: number;         // when PENDING → ACTIVE (drives the time stop)
+  activationPrice?: number;     // prix RÉEL au passage ACTIVE (le fill) — le R honnête se mesure d'ici, pas du milieu de zone
 
   // Context
   timeframe: string;            // primary TF of the setup
@@ -92,6 +94,7 @@ export interface TradeScenario {
     adjustedScore: number;
     hasAnchorSignal: boolean;
     clusterBonus: number;
+    templateModifier?: number;  // historical-winrate calibration factor
   };
 
   // TP tracking (Phase 2.3)
@@ -108,6 +111,18 @@ export interface TradeScenario {
   // Excursion tracking (Phase 4)
   maxFavorableExcursion?: number;
   maxAdverseExcursion?: number;
+
+  // Second avis du LLM Risk Desk (optionnel — absent si LLM désactivé)
+  llmVerdict?: {
+    verdict: 'APPROVE' | 'REDUCE' | 'REJECT';
+    confidence: number;
+    bullCase: string;
+    bearCase: string;
+    riskNotes: string;
+    model: string;
+    latencyMs: number;
+    reviewedAt: number;
+  };
 }
 
 // Signal event fed into the confluence engine

@@ -13,16 +13,28 @@ export class MetricsCalculator {
   private liquidationVolumes: { timestamp: number; usd: number }[] = [];
 
   private prevTradesPerMinute = 0;
+  private lastPruneAt = 0;
 
   onTrade(trade: NormalizedTrade) {
     const now = Date.now();
     this.tradeTimestamps.push(now);
     this.tradeVolumes.push({ timestamp: now, usd: trade.usdValue });
 
-    // Clean old data (keep last 2 minutes)
-    const cutoff = now - 120000;
-    this.tradeTimestamps = this.tradeTimestamps.filter(t => t >= cutoff);
-    this.tradeVolumes = this.tradeVolumes.filter(t => t.timestamp >= cutoff);
+    // Prune at most once per second — NOT on every trade. Filtering both
+    // 2-minute arrays per trade was O(n) per trade (~77M iterations/s and
+    // ~190MB/s of array churn at NY-open volume), which saturated the GC and
+    // froze the event loop. getMetrics() re-filters by time, so a 1s prune lag
+    // costs nothing. This is the core fix for the high-volume freeze.
+    if (now - this.lastPruneAt >= 1000) {
+      this.lastPruneAt = now;
+      const cutoff = now - 120000;
+      let i = 0;
+      while (i < this.tradeTimestamps.length && this.tradeTimestamps[i] < cutoff) i++;
+      if (i > 0) {
+        this.tradeTimestamps.splice(0, i);
+        this.tradeVolumes.splice(0, i);
+      }
+    }
   }
 
   onLiquidation(liq: Liquidation) {

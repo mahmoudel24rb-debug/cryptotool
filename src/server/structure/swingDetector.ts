@@ -13,7 +13,11 @@ export class SwingDetector {
   private config: SwingDetectorConfig;
   private swingHighs: SwingPoint[] = [];
   private swingLows: SwingPoint[] = [];
-  private lastProcessedIndex = -1;
+  // Curseur par TEMPS de bougie, pas par index : les tableaux de bougies sont
+  // élagués en production (candleBuilder.pruneCandles) et en backtest — un
+  // index absolu devenait > taille du tableau et gelait la détection de
+  // swings pour toujours (structure morte après ~3 jours d'uptime en live)
+  private lastProcessedTime = -1;
 
   constructor(config: SwingDetectorConfig) {
     this.config = config;
@@ -35,11 +39,11 @@ export class SwingDetector {
     // because we need `lookback` candles after it to confirm.
     const checkIdx = len - 1 - lookback;
 
-    // Only process each index once
-    if (checkIdx <= this.lastProcessedIndex) return newSwings;
-    this.lastProcessedIndex = checkIdx;
-
     const candidate = candles[checkIdx];
+
+    // Only process each candle once (by time — robust to array pruning)
+    if (candidate.time <= this.lastProcessedTime) return newSwings;
+    this.lastProcessedTime = candidate.time;
 
     // Check swing high
     let isSwingHigh = true;
@@ -89,8 +93,17 @@ export class SwingDetector {
       newSwings.push(swing);
     }
 
-    // Update broken status based on current price
-    const currentCandle = candles[len - 1];
+    return newSwings;
+  }
+
+  /**
+   * Marque les swings franchis par la clôture courante.
+   * DOIT être appelé APRÈS la détection de cassures par l'analyzer : quand ce
+   * marquage vivait dans update(), tout swing franchi était déjà `broken` au
+   * moment où l'analyzer cherchait `close > swing non-cassé` → la détection
+   * BOS/CHoCH était structurellement impossible (morte depuis l'origine).
+   */
+  markBroken(currentCandle: Candle): void {
     for (const sh of this.swingHighs) {
       if (!sh.broken && currentCandle.close > sh.price) {
         sh.broken = true;
@@ -103,8 +116,6 @@ export class SwingDetector {
         sl.brokenAt = currentCandle.time;
       }
     }
-
-    return newSwings;
   }
 
   /** Bulk process historical candles — runs through all of them (O(n), no slice) */
@@ -115,11 +126,12 @@ export class SwingDetector {
     // Reset state
     this.swingHighs = [];
     this.swingLows = [];
-    this.lastProcessedIndex = -1;
+    this.lastProcessedTime = -1;
 
     // Process each "closing" by passing endIndex instead of slicing
     for (let end = lookback * 2 + 1; end <= candles.length; end++) {
       this.update(candles, end);
+      this.markBroken(candles[end - 1]);
     }
   }
 

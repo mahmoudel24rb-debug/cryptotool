@@ -1,6 +1,5 @@
 node_modules/
 dist/
-public/charting_library/
 *.log
 .env
 .env.*
@@ -10,3 +9,8 @@ public/charting_library/
 *.gif
 *.bmp
 *.webp
+
+# NB : public/charting_library/ n'est PAS ignoré ici mais dans .git/info/exclude
+# (protection git locale équivalente) — car `railway up` applique ce fichier
+# et refusait d'uploader la librairie, indispensable au chart en production.
+# Licence TradingView : ce dossier ne doit JAMAIS être poussé sur un repo public.

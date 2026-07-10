@@ -1,9 +1,10 @@
 # MACKUANT Project Memory
 
 ## Project: crypto-orderflow-monitor
-- Location: `c:\Users\dglco\Documents\crypto\crypto-orderflow-monitor`
-- Stack: TypeScript, Node.js backend, React frontend, WebSocket, Canvas 2D
+- Location: `c:\Users\dglco\Documents\code\cryptotool`
+- Stack: TypeScript, Node.js backend, React frontend, WebSocket, TradingView Charting Library (price chart) + Canvas 2D (panels annexes)
 - User language: French
+- NB: les sections ci-dessous datent de fev 2026 — voir ALGORITHME_SCENARIOS.md (refontes juin/juillet 2026) pour l'etat actuel
 
 ## Architecture
 - 5 exchanges (Binance spot+futures, Bybit, Coinbase, OKX, Hyperliquid) via WebSocket

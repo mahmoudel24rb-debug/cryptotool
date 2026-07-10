@@ -182,6 +182,7 @@ export default function Chart({
   const structureRef = useRef(structureData);
   const overlayTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const drawingRef = useRef(false); // mutex to prevent concurrent draws
+  const overlaySigRef = useRef(''); // skip redraw when overlay inputs haven't changed
 
   // Exchange selector state
   const [selectedExchange, setSelectedExchange] = useState<string | null>(null);
@@ -223,6 +224,7 @@ export default function Chart({
       }
       widgetRef.current.activeChart().setSymbol(newSymbol);
       activeSymbolRef.current = newSymbol;
+      overlaySigRef.current = ''; // force overlay redraw on the new series
     } catch (_) { /* ignore */ }
   }, []);
 
@@ -352,10 +354,40 @@ export default function Chart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.candleTickVersion, htfCandles]);
 
+  // Stable signature of everything that affects overlay rendering — redrawing
+  // identical shapes every 15s caused a visible flicker (and shape churn
+  // during volatile periods)
+  function computeOverlaySignature(): string {
+    const vwap = vwapRef.current;
+    const structure = structureRef.current;
+    const parts: (string | number)[] = [];
+    // VWAP rounded to $10 buckets — per-tick precision would invalidate the
+    // signature every redraw cycle and defeat the skip
+    if (vwap) parts.push(Math.round(vwap.vwap / 10), Math.round(vwap.upperBand2 / 10), Math.round(vwap.lowerBand2 / 10));
+    if (structure) {
+      const tfKey = Object.keys(structure)[0];
+      const s = tfKey ? structure[tfKey] : null;
+      if (s) {
+        for (const ob of s.orderBlocks || []) parts.push(ob.id, ob.mitigated ? 1 : 0);
+        for (const fvg of s.fvgs || []) parts.push(fvg.id, fvg.filled ? 1 : 0, Math.round(fvg.filledPercent));
+        for (const brk of (s.recentBreaks || []).slice(-5)) parts.push(brk.timestamp, brk.type);
+        for (const pool of s.liquidityPools || []) parts.push(pool.id, pool.swept ? 1 : 0, pool.strength);
+        for (const sh of (s.swingHighs || []).slice(-4)) parts.push(sh.timestamp, sh.broken ? 1 : 0);
+        for (const sl of (s.swingLows || []).slice(-4)) parts.push(sl.timestamp, sl.broken ? 1 : 0);
+      }
+    }
+    return parts.join('|');
+  }
+
   // ── Draw all overlays (async-safe with mutex) ──
   async function drawAllOverlays() {
     if (!widgetRef.current || !readyRef.current) return;
     if (drawingRef.current) return; // skip if already drawing
+
+    const sig = computeOverlaySignature();
+    if (sig === overlaySigRef.current) return; // nothing changed since last draw
+    overlaySigRef.current = sig;
+
     drawingRef.current = true;
 
     try {

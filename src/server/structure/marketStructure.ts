@@ -145,6 +145,10 @@ export class MarketStructureAnalyzer {
       this.recentBreaks = this.recentBreaks.slice(0, MAX_BREAKS);
     }
 
+    // APRÈS la détection : marque les swings restants franchis par la clôture
+    // (ex. CHoCH refusé faute de displacement) pour éviter les niveaux périmés
+    this.swingDetector.markBroken(currentCandle);
+
     return breaks;
   }
 

@@ -1,5 +1,24 @@
 # Algorithme de Generation de Scenarios de Trade
 
+> **Refonte v2 (juillet 2026)** — constat post-refonte : le moteur n'emettait plus RIEN (noAnchor systematique), car il ne voyait que les CREATIONS de zones, jamais leurs retests. Changements :
+> - **Feeder de retest** : toutes les 2s, si le prix re-entre dans un OB actif non mitige ou un FVG non comble (age >= 3 min), un signal OB_RETEST / FVG_FILL est emis (cooldown 10 min par zone). Le pullback dans une zone tenue est desormais l'entree de reference (templates 11 et 12).
+> - **TP structurels** : les TP sont cappes juste devant le premier niveau oppose (pool de liquidite, POC/VAH/VAL, swing non casse) au lieu de R-multiples aveugles ; si le premier niveau est a < 0.6R, pas de trade. Le check minRiskReward (1.2 vers TP2) redevient significatif.
+> - **SL par timeframe** : buffer = 2xATR(1m) x sqrt(minutes du TF de l'ancre) — une zone 15m respire plus qu'une zone 1m.
+> - **Ancres elargies** : FVG/FVG_FILL peuvent ancrer (poids min 10) ; multiplicateur x1.3 pour les signaux de retest ; minScore 35.
+> - Le Risk Desk (LLM) revoit tous les scenarios emis (minScoreForReview 35).
+>
+> **Refonte juin 2026** — le moteur a ete largement retravaille apres constat que les scenarios finissaient systematiquement en stop loss :
+> - **Entree en pullback** : la zone d'entree = la zone structurelle du signal ancre (OB/FVG/sweep), elle n'est plus etiree jusqu'au prix courant (qui transformait chaque scenario en entree au marche instantanee).
+> - **SL elargi** : 2×ATR(1m) derriere la zone (plancher 0.25%) au lieu de 1×ATR — le stop n'est plus dans le bruit.
+> - **TP honnetes** : R-multiples (1R/2R/3R) mesures depuis entryMid avec le vrai risque, au lieu d'un "risque" gonfle par toute la largeur de zone.
+> - **Filtre de regime momentum** : deplacement > 4×ATR en 5 min = impulsion en cours → aucun scenario contre le mouvement (fini les couteaux qui tombent).
+> - **Contre-tendance durcie** : hard block |trend| > 40 (avant 60), soft block > 25 avec rawScore ≥ 55.
+> - **Ancre structurelle obligatoire** : seuls OB / sweep / BOS / CHoCH peuvent ancrer un scenario (VWAP/POC/spike ne sont que du support).
+> - **Cycle de vie** : entree manquee (prix parti a +1.5R sans retest) → annulation ; ACTIVE sans TP1 en 45 min → time stop ; PENDING expire a 30 min sans exemption de score.
+> - **Calibration automatique** : winrate historique par template (scenario_outcomes.jsonl) module le score (×0.75 a ×1.15).
+> - **Signaux de contexte throttles** : VWAP ±2σ et POC emis au plus 1×/2 min (avant : chaque seconde, biais mean-reversion permanent).
+> - Les sections ci-dessous decrivent la mecanique generale ; les constantes a jour sont dans `SCENARIO_CONFIG` (src/server/scenarios/confluenceEngine.ts).
+
 ## Vue d'ensemble
 
 Le systeme genere des scenarios de trade en combinant des **signaux** provenant de multiples sources (structure de marche, order flow, derivatives) dans un **moteur de confluence**. Quand suffisamment de signaux convergent dans la meme zone de prix et la meme direction, un scenario est emis.

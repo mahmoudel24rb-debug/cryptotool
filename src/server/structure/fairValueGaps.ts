@@ -1,5 +1,6 @@
 import { Candle } from '../candles/candleBuilder';
 import { FairValueGap, FVGConfig } from './types';
+import { clock } from '../clock';
 
 const MAX_FVGS = 60;
 
@@ -98,7 +99,7 @@ export class FairValueGapDetector {
           if (currentLow <= fvg.low) {
             fvg.filled = true;
             fvg.filledPercent = 100;
-            fvg.filledAt = Math.floor(Date.now() / 1000);
+            fvg.filledAt = Math.floor(clock.now() / 1000);
           }
         }
       } else {
@@ -109,7 +110,7 @@ export class FairValueGapDetector {
           if (currentHigh >= fvg.high) {
             fvg.filled = true;
             fvg.filledPercent = 100;
-            fvg.filledAt = Math.floor(Date.now() / 1000);
+            fvg.filledAt = Math.floor(clock.now() / 1000);
           }
         }
       }

@@ -27,6 +27,10 @@ export const TIMEFRAMES: Record<string, number> = {
   '4h': 14400,
 };
 
+// Precomputed entries — avoids allocating a new array from Object.entries()
+// on every single trade in the per-trade hot loop.
+const TIMEFRAME_ENTRIES: [string, number][] = Object.entries(TIMEFRAMES);
+
 /**
  * Multi-timeframe candle builder.
  * Builds candles from normalized trades and emits 'candle:close' events.
@@ -46,7 +50,7 @@ export class CandleBuilder extends EventEmitter {
 
   /** Process a single trade — updates all timeframes */
   onTrade(trade: NormalizedTrade): void {
-    for (const [tf, intervalSec] of Object.entries(TIMEFRAMES)) {
+    for (const [tf, intervalSec] of TIMEFRAME_ENTRIES) {
       const intervalMs = intervalSec * 1000;
       const candleTime = Math.floor(trade.timestamp / intervalMs) * intervalSec;
       const candles = this.candles.get(tf)!;

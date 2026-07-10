@@ -7,6 +7,7 @@ export interface NormalizedTrade {
   side: 'BUY' | 'SELL';   // taker side
   timestamp: number;       // ms
   usdValue: number;        // price * quantity (in USD)
+  source?: 'REST';         // set when delivered by a REST fallback poll (WS down)
 }
 
 export interface OrderBook {

@@ -8,8 +8,9 @@ import {
   SignalContribution,
 } from './types';
 import { matchTemplate, ScenarioTemplate } from './scenarioTemplates';
-import { appendFileSync, mkdirSync, existsSync, writeFileSync, readFileSync } from 'fs';
+import { appendFile, mkdirSync, existsSync, writeFileSync, readFileSync, promises as fsp } from 'fs';
 import { dirname } from 'path';
+import { clock } from '../clock';
 
 // ═══════════════════════════════════════════════════════════════
 // Configurable constants — all tunables in one place
@@ -42,30 +43,77 @@ export const SCENARIO_CONFIG = {
   CLUSTER_BONUS_LOW: 5,              // 1-2 paires
 
   // Phase 3.3 — Signal anchor minimum
-  MINIMUM_ANCHOR_WEIGHT: 15,         // au moins 1 signal poids >= 15 (OB, SWEEP, STRUCTURE)
+  MINIMUM_ANCHOR_WEIGHT: 10,         // au moins 1 signal structurel poids >= 10 (OB, SWEEP, STRUCTURE, FVG)
+  // L'ancre doit venir d'un TF >= 5m : une zone 1m est du bruit de
+  // microstructure (et les frais mangent le R serré des trades 1m).
+  // Les signaux 1m restent des supports de confluence, jamais le porteur.
+  ANCHOR_MIN_TF_MINUTES: 5,
+
+  // ── Régime de volatilité (audit 2026-07-11 : 300 évaluations → 0 émission) ──
+  // En range mort (ATR/prix < seuil QUIET), la structure 5m/15m ne se met plus à
+  // jour : exiger une ancre >= 5m revient à tout rejeter (noAnchor dominait les
+  // logs). En QUIET, la structure 1m EST la structure tradeable — le plancher SL
+  // (MIN_SL_BUFFER_PCT) et le check R:R continuent de protéger contre les micro-
+  // trades mangés par les frais. Les seuils redeviennent stricts hors QUIET.
+  VOL_REGIME_QUIET_ATR_PCT: 0.0008,   // ATR/prix < 0.08 % → régime QUIET
+  VOL_REGIME_HOT_ATR_PCT: 0.0025,     // ATR/prix > 0.25 % → régime HOT
+  ANCHOR_MIN_TF_MINUTES_QUIET: 1,     // ancre 1m acceptée uniquement en QUIET
+  MIN_SCORE_QUIET_FACTOR: 0.85,       // scores structurellement plus bas en QUIET
+                                      // (peu de signaux à gros poids disponibles)
+
+  // Refonte v2 — retest scoring
+  // Un retest de zone tenue EST la confluence recherchée : sans ce boost,
+  // les multiplicateurs TF/force écrasaient le score sous le seuil d'émission
+  RETEST_SCORE_MULTIPLIER: 1.3,
+  RETEST_TYPES: new Set(['OB_RETEST', 'FVG_FILL']),
+
+  // Refonte v2 — TP structurels
+  // Le pré-check de place ne rejette que l'absurde (< 0.3R) — c'est le check
+  // minRiskReward sur TP2 CAPPÉ qui arbitre la qualité réelle du trade
+  MIN_ROOM_TO_FIRST_LEVEL_R: 0.3,
+  TP_LEVEL_PADDING_ATR: 0.3,         // TP posé juste devant le niveau, pas dessus
 
   // Counter-trend blocking
-  TREND_HARD_BLOCK_THRESHOLD: 60,    // |trendScore| above → block ALL counter-trend
-  TREND_SOFT_BLOCK_THRESHOLD: 45,    // |trendScore| above → require high rawScore for counter-trend
-  COUNTER_TREND_MIN_RAW_SCORE: 45,   // minimum rawScore for counter-trend in moderate trend
+  TREND_HARD_BLOCK_THRESHOLD: 40,    // |trendScore| above → block ALL counter-trend
+  TREND_SOFT_BLOCK_THRESHOLD: 25,    // |trendScore| above → require high rawScore for counter-trend
+  COUNTER_TREND_MIN_RAW_SCORE: 55,   // minimum rawScore for counter-trend in moderate trend
+
+  // Momentum regime filter: when price displaced > N×ATR over the window,
+  // the market is in a directional impulse — block all counter-move scenarios
+  REGIME_WINDOW_MS: 300_000,         // 5 min displacement window
+  REGIME_SAMPLE_INTERVAL_MS: 5_000,  // price sampling cadence
+  REGIME_DISPLACEMENT_ATR: 4,        // |move| > 4×ATR(1m) over window → momentum regime
 
   // Cross-template deduplication
   DEDUP_OVERLAP_THRESHOLD: 0.5,      // 50% entry zone overlap = same trade
 
   // SL cooldown after stop-loss hit
   SL_COOLDOWN_MS: 300_000,           // 5 min cooldown after SL
-  SL_COOLDOWN_OVERRIDE_SCORE: 55,    // HIGH score can bypass cooldown
+  SL_COOLDOWN_OVERRIDE_SCORE: 65,    // only very high scores can bypass cooldown
 
   // ATR-based stop loss
   SL_MODE: 'ATR' as 'ATR' | 'FIXED',
-  ATR_SL_MULTIPLIER: 1.0,
-  MIN_SL_BUFFER_PCT: 0.001,          // 0.1% floor
+  ATR_SL_MULTIPLIER: 2.0,            // 1×ATR(1m) was pure noise — stops swept constantly
+  MIN_SL_BUFFER_PCT: 0.0025,         // 0.25% floor
 
-  // Entry & TP
-  ENTRY_BUFFER_PCT: 0.0015,          // 0.15% entry buffer
-  TP1_MULTIPLIER: 1.0,
+  // Entry & TP — entry zone comes from the anchor signal's structural zone
+  // (OB/FVG bounds, sweep level), NOT stretched to current price.
+  ENTRY_BUFFER_PCT: 0.0005,          // 0.05% pad around the structural zone
+  MAX_ENTRY_ZONE_PCT: 0.006,         // clamp zones wider than 0.6% of price
+  TP1_MULTIPLIER: 1.0,               // R-multiples measured from entryMid vs TRUE risk
   TP2_MULTIPLIER: 2.0,
-  TP3_MULTIPLIER: 3.5,
+  TP3_MULTIPLIER: 3.0,
+  MISSED_ENTRY_R: 1.5,               // PENDING cancelled if price runs 1.5R toward TP without retest
+  ACTIVE_TIME_STOP_MS: 45 * 60 * 1000, // ACTIVE without TP1 after 45 min → time stop
+
+  // Evaluation throttle: alert storms used to trigger a full evaluate() per signal
+  EVAL_MIN_INTERVAL_MS: 1_000,
+
+  // Template auto-calibration from data/scenario_outcomes.jsonl
+  TEMPLATE_STATS_MIN_N: 8,           // need ≥8 resolved outcomes before adjusting
+  TEMPLATE_MODIFIER_MIN: 0.75,
+  TEMPLATE_MODIFIER_MAX: 1.15,
+  TEMPLATE_BASELINE_WINRATE: 0.45,
 
   // Phase 1.4 — TTL par type de signal (ms)
   SIGNAL_TTL_MS: {
@@ -108,6 +156,7 @@ export const SCENARIO_CONFIG = {
   STATE_SAVE_INTERVAL_MS: 30_000, // save active scenarios every 30s
 };
 
+// Defaults mirror config.json — config values win at runtime
 const DEFAULT_CONFIG: ConfluenceConfig = {
   weights: {
     structure: 15,
@@ -115,7 +164,7 @@ const DEFAULT_CONFIG: ConfluenceConfig = {
     fairValueGap: 10,
     liquiditySweep: 20,
     absorption: 10,
-    divergence: 5,
+    divergence: 8,
     spike: 5,
     velocity: 5,
     twap: 5,
@@ -127,14 +176,13 @@ const DEFAULT_CONFIG: ConfluenceConfig = {
     vwapPosition: 5,
     volumeProfile: 5,
   },
-  minScoreForScenario: 35,
-  highPriorityThreshold: 60,
+  minScoreForScenario: 25,   // recalibré : les forces de signaux sont clampées à [0,1] désormais
+  highPriorityThreshold: 55,
   extremePriorityThreshold: 75,
-  signalTimeWindowMs: 300000,       // fallback, overridden by per-signal TTL
   scenarioExpirationMs: 1800000,
-  maxActiveScenarios: 3,
-  minRiskReward: 1.5,
-  slBufferPercent: 0.2,             // Phase 2.1: 0.1 → 0.2%
+  maxActiveScenarios: 4,
+  minRiskReward: 1.2,
+  slBufferPercent: 0.25,            // fallback si ATR indisponible
 };
 
 // Map signal types to weight keys
@@ -201,19 +249,61 @@ function computeTemporalClusterBonus(signals: ConfluenceSignal[]): number {
 
 // ═══════════════════════════════════════════════════════════════
 // Helper: anchor signal check (Phase 3.3)
+// Anchors must be STRUCTURAL — a trade needs a level to lean on.
+// Context/momentum signals (VWAP, POC, spike…) can support, never anchor.
 // ═══════════════════════════════════════════════════════════════
+
+const ANCHOR_SIGNAL_TYPES = new Set([
+  'ORDER_BLOCK', 'OB_RETEST', 'OB',
+  'LIQUIDITY_SWEEP', 'SWEEP',
+  'STRUCTURE', 'BOS', 'CHoCH',
+  'FVG', 'FVG_FILL', // un FVG actif est un niveau structurel tradeable
+]);
+
+const TF_MINUTES: Record<string, number> = { '1m': 1, '5m': 5, '15m': 15, '1h': 60, '4h': 240 };
+
+function isAnchorSignal(
+  s: ConfluenceSignal,
+  direction: ScenarioDirection,
+  weights: ConfluenceConfig['weights'],
+  anchorMinTf: number = SCENARIO_CONFIG.ANCHOR_MIN_TF_MINUTES,
+): boolean {
+  if (s.direction !== direction) return false;
+  if (!ANCHOR_SIGNAL_TYPES.has(s.type)) return false;
+  if ((TF_MINUTES[s.timeframe || '1m'] ?? 1) < anchorMinTf) return false;
+  const weightKey = SIGNAL_WEIGHT_MAP[s.type];
+  const weight = weightKey ? weights[weightKey] : 5;
+  return weight >= SCENARIO_CONFIG.MINIMUM_ANCHOR_WEIGHT;
+}
 
 function hasAnchorSignal(
   signals: ConfluenceSignal[],
   direction: ScenarioDirection,
   weights: ConfluenceConfig['weights'],
+  anchorMinTf: number = SCENARIO_CONFIG.ANCHOR_MIN_TF_MINUTES,
 ): boolean {
-  return signals.some(s => {
-    if (s.direction !== direction) return false;
+  return signals.some(s => isAnchorSignal(s, direction, weights, anchorMinTf));
+}
+
+/** Pick the best anchor: highest weight, then freshest */
+function pickAnchorSignal(
+  signals: ConfluenceSignal[],
+  direction: ScenarioDirection,
+  weights: ConfluenceConfig['weights'],
+  anchorMinTf: number = SCENARIO_CONFIG.ANCHOR_MIN_TF_MINUTES,
+): ConfluenceSignal | null {
+  let best: ConfluenceSignal | null = null;
+  let bestWeight = -1;
+  for (const s of signals) {
+    if (!isAnchorSignal(s, direction, weights, anchorMinTf)) continue;
     const weightKey = SIGNAL_WEIGHT_MAP[s.type];
     const weight = weightKey ? weights[weightKey] : 5;
-    return weight >= SCENARIO_CONFIG.MINIMUM_ANCHOR_WEIGHT;
-  });
+    if (weight > bestWeight || (weight === bestWeight && best && s.timestamp > best.timestamp)) {
+      best = s;
+      bestWeight = weight;
+    }
+  }
+  return best;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -239,12 +329,47 @@ export class ConfluenceEngine {
   private lastSLTimestamp: Record<string, number> = { LONG: 0, SHORT: 0 };
   private trendProvider: TrendProvider | null = null;
 
-  constructor(config: Partial<ConfluenceConfig> = {}) {
+  // Momentum regime: rolling price samples over the displacement window
+  private priceSamples: { t: number; p: number }[] = [];
+  private lastPriceSampleAt = 0;
+
+  // Refonte v2: niveaux structurels (pools, POC/VAH/VAL, swings) pour capper les TP
+  private marketLevels: number[] = [];
+
+  // Evaluation throttle (alert storms used to run a full evaluate() per signal)
+  private lastEvalAt = 0;
+  private evalScheduled = false;
+
+  // Template auto-calibration from historical outcomes
+  private templateStats = new Map<number, { wins: number; losses: number }>();
+
+  // Persistence dirty flag — written by the periodic saver instead of per-event sync writes
+  private stateDirty = false;
+
+  // Mode backtest : évaluation synchrone (pas de setTimeout), outcomes envoyés
+  // à un sink au lieu du JSONL, logs console coupés, stats live non chargées
+  private quiet = false;
+  private syncEvaluation = false;
+  private outcomeSink: ((outcome: Record<string, unknown>) => void) | null = null;
+
+  constructor(
+    config: Partial<ConfluenceConfig> = {},
+    opts: {
+      loadTemplateStats?: boolean;
+      quiet?: boolean;
+      syncEvaluation?: boolean;
+      outcomeSink?: (outcome: Record<string, unknown>) => void;
+    } = {},
+  ) {
     this.config = {
       ...DEFAULT_CONFIG,
       ...config,
       weights: { ...DEFAULT_CONFIG.weights, ...(config.weights || {}) },
     };
+    this.quiet = opts.quiet ?? false;
+    this.syncEvaluation = opts.syncEvaluation ?? false;
+    this.outcomeSink = opts.outcomeSink ?? null;
+    if (opts.loadTemplateStats ?? true) this.loadTemplateStats();
   }
 
   /** Inject the TrendAnalyzer for trend-aligned scoring (Phase 1.1) */
@@ -266,17 +391,58 @@ export class ConfluenceEngine {
 
   updatePrice(price: number): void {
     this.currentPrice = price;
+
+    // Sample price for the momentum regime filter
+    const now = clock.now();
+    if (now - this.lastPriceSampleAt >= SCENARIO_CONFIG.REGIME_SAMPLE_INTERVAL_MS) {
+      this.lastPriceSampleAt = now;
+      this.priceSamples.push({ t: now, p: price });
+      const cutoff = now - SCENARIO_CONFIG.REGIME_WINDOW_MS - 30_000;
+      while (this.priceSamples.length > 0 && this.priceSamples[0].t < cutoff) {
+        this.priceSamples.shift();
+      }
+    }
+  }
+
+  getCurrentPrice(): number {
+    return this.currentPrice;
+  }
+
+  /** Refonte v2 : niveaux opposés (liquidité, POC/VAH/VAL, swings) fournis par l'engine */
+  updateMarketLevels(levels: number[]): void {
+    this.marketLevels = levels;
   }
 
   updateATR(atr: number): void {
     if (atr > 0) this.currentATR = atr;
   }
 
-  /** Feed a new signal into the engine — triggers evaluation */
+  /**
+   * Momentum regime: price displaced > N×ATR over the window means a directional
+   * impulse is in progress. Returns the impulse direction, or null if ranging.
+   * During an impulse, knife-catching counter-move scenarios are blocked.
+   */
+  private getMomentumRegime(): ScenarioDirection | null {
+    if (this.currentATR <= 0 || this.priceSamples.length === 0) return null;
+    const windowStart = clock.now() - SCENARIO_CONFIG.REGIME_WINDOW_MS;
+    // Oldest sample within the window
+    let ref: { t: number; p: number } | null = null;
+    for (const s of this.priceSamples) {
+      if (s.t >= windowStart) { ref = s; break; }
+    }
+    if (!ref) ref = this.priceSamples[this.priceSamples.length - 1];
+    const displacement = this.currentPrice - ref.p;
+    if (Math.abs(displacement) > SCENARIO_CONFIG.REGIME_DISPLACEMENT_ATR * this.currentATR) {
+      return displacement > 0 ? 'LONG' : 'SHORT';
+    }
+    return null;
+  }
+
+  /** Feed a new signal into the engine — schedules a throttled evaluation */
   addSignal(signal: ConfluenceSignal): void {
     // Dedup: if same type + direction exists within 30s, keep strongest only
     const DEDUP_WINDOW_MS = 30_000;
-    const now = Date.now();
+    const now = clock.now();
     const dupIndex = this.signals.findIndex(s =>
       s.type === signal.type &&
       s.direction === signal.direction &&
@@ -293,11 +459,60 @@ export class ConfluenceEngine {
 
     this.signals.push(signal);
     this.pruneOldSignals();
-    this.evaluate();
+    this.scheduleEvaluate();
+  }
+
+  /** Throttle: at most one evaluate() per EVAL_MIN_INTERVAL_MS, even during alert storms */
+  private scheduleEvaluate(): void {
+    if (this.syncEvaluation) { this.evaluate(); return; } // backtest : pas de timers réels
+    const now = clock.now();
+    const elapsed = now - this.lastEvalAt;
+    if (elapsed >= SCENARIO_CONFIG.EVAL_MIN_INTERVAL_MS) {
+      this.lastEvalAt = now;
+      this.evaluate();
+      return;
+    }
+    if (this.evalScheduled) return;
+    this.evalScheduled = true;
+    setTimeout(() => {
+      this.evalScheduled = false;
+      this.lastEvalAt = clock.now();
+      this.evaluate();
+    }, SCENARIO_CONFIG.EVAL_MIN_INTERVAL_MS - elapsed);
   }
 
   private lastDiagnosticLog = 0;
-  private evalStats = { calls: 0, noAnchor: 0, lowScore: 0, counterBlocked: 0, noTemplate: 0, duplicate: 0, lowRR: 0, emitted: 0 };
+  private evalStats = {
+    calls: 0, noAnchor: 0, anchorTfBlocked: 0, lowScore: 0, counterBlocked: 0, regimeBlocked: 0,
+    noTemplate: 0, duplicate: 0, lowRR: 0, badZone: 0, zoneBroken: 0, noRoom: 0, emitted: 0,
+    // Near-miss : à quelle distance des seuils meurent les rejets (pour régler au scalpel)
+    nearMissScores: [] as number[], nearMissRR: [] as number[],
+  };
+  /** Raison précise du dernier échec de buildScenario (diagnostic badZone) */
+  private lastBuildFail: 'zoneBroken' | 'noRoom' | 'other' | null = null;
+
+  /** Régime de volatilité courant (ATR en % du prix) */
+  volRegime(): 'QUIET' | 'NORMAL' | 'HOT' {
+    if (this.currentPrice <= 0 || this.currentATR <= 0) return 'NORMAL';
+    const atrPct = this.currentATR / this.currentPrice;
+    if (atrPct < SCENARIO_CONFIG.VOL_REGIME_QUIET_ATR_PCT) return 'QUIET';
+    if (atrPct > SCENARIO_CONFIG.VOL_REGIME_HOT_ATR_PCT) return 'HOT';
+    return 'NORMAL';
+  }
+
+  /** TF minimum d'ancrage effectif selon le régime */
+  private anchorMinTfEff(): number {
+    return this.volRegime() === 'QUIET'
+      ? SCENARIO_CONFIG.ANCHOR_MIN_TF_MINUTES_QUIET
+      : SCENARIO_CONFIG.ANCHOR_MIN_TF_MINUTES;
+  }
+
+  /** Seuil de score effectif selon le régime */
+  private minScoreEff(): number {
+    return this.volRegime() === 'QUIET'
+      ? Math.round(this.config.minScoreForScenario * SCENARIO_CONFIG.MIN_SCORE_QUIET_FACTOR)
+      : this.config.minScoreForScenario;
+  }
 
   /** Periodic tick — check expirations and lifecycle */
   tick(): void {
@@ -305,16 +520,81 @@ export class ConfluenceEngine {
     this.updateScenarioLifecycle();
 
     // Diagnostic log every 5 minutes
-    const now = Date.now();
-    if (now - this.lastDiagnosticLog >= 300_000) {
+    const now = clock.now();
+    if (!this.quiet && now - this.lastDiagnosticLog >= 300_000) {
       this.lastDiagnosticLog = now;
       const signalTypes = new Map<string, number>();
       for (const s of this.signals) signalTypes.set(s.type, (signalTypes.get(s.type) || 0) + 1);
       const typeSummary = Array.from(signalTypes.entries()).map(([t, n]) => `${t}:${n}`).join(', ');
       const trendInfo = this.trendProvider ? this.trendProvider.analyze() : { score: 0, trend: 'N/A' };
-      console.log(`[CONFLUENCE] signals=${this.signals.length} [${typeSummary}] | price=$${this.currentPrice.toFixed(0)} atr=${this.currentATR.toFixed(1)} | trend=${trendInfo.trend}(${trendInfo.score}) | active=${this.getActiveScenarios().length} | eval: ${this.evalStats.calls} calls, noAnchor=${this.evalStats.noAnchor} lowScore=${this.evalStats.lowScore} counterBlock=${this.evalStats.counterBlocked} noTemplate=${this.evalStats.noTemplate} dup=${this.evalStats.duplicate} lowRR=${this.evalStats.lowRR} emitted=${this.evalStats.emitted}`);
-      this.evalStats = { calls: 0, noAnchor: 0, lowScore: 0, counterBlocked: 0, noTemplate: 0, duplicate: 0, lowRR: 0, emitted: 0 };
+      const atrPct = this.currentPrice > 0 ? (this.currentATR / this.currentPrice) * 100 : 0;
+      const nearScores = this.evalStats.nearMissScores.length ? ` nearScore=[${this.evalStats.nearMissScores.join(',')}]` : '';
+      const nearRR = this.evalStats.nearMissRR.length ? ` nearRR=[${this.evalStats.nearMissRR.join(',')}]` : '';
+      console.log(`[CONFLUENCE] signals=${this.signals.length} [${typeSummary}] | price=$${this.currentPrice.toFixed(0)} atr=${this.currentATR.toFixed(1)} (${atrPct.toFixed(3)}%) regime=${this.volRegime()} anchorTf>=${this.anchorMinTfEff()}m minScore=${this.minScoreEff()} | trend=${trendInfo.trend}(${trendInfo.score}) | active=${this.getActiveScenarios().length} | eval: ${this.evalStats.calls} calls, noAnchor=${this.evalStats.noAnchor} anchorTfBlock=${this.evalStats.anchorTfBlocked} lowScore=${this.evalStats.lowScore} counterBlock=${this.evalStats.counterBlocked} regimeBlock=${this.evalStats.regimeBlocked} noTemplate=${this.evalStats.noTemplate} dup=${this.evalStats.duplicate} lowRR=${this.evalStats.lowRR} badZone=${this.evalStats.badZone}(broken=${this.evalStats.zoneBroken},noRoom=${this.evalStats.noRoom}) emitted=${this.evalStats.emitted}${nearScores}${nearRR}`);
+      this.evalStats = {
+        calls: 0, noAnchor: 0, anchorTfBlocked: 0, lowScore: 0, counterBlocked: 0, regimeBlocked: 0,
+        noTemplate: 0, duplicate: 0, lowRR: 0, badZone: 0, zoneBroken: 0, noRoom: 0, emitted: 0,
+        nearMissScores: [], nearMissRR: [],
+      };
     }
+  }
+
+  /** Stats de calibration d'un template (pour le dossier Risk Desk) */
+  getTemplateStatsFor(templateId: number): { wins: number; losses: number } | null {
+    return this.templateStats.get(templateId) ?? null;
+  }
+
+  /** Compteurs d'évaluation (cumulés en mode quiet — diagnostic backtest) */
+  getEvalStats() {
+    return { ...this.evalStats };
+  }
+
+  /**
+   * Applique le verdict du LLM Risk Desk à un scénario encore vivant.
+   * APPROVE : inchangé. REDUCE : score -15%. REJECT : priorité LOW,
+   * et invalidation si le veto est activé. Tout est loggé pour mesure.
+   */
+  applyLlmVerdict(
+    scenarioId: string,
+    verdict: NonNullable<TradeScenario['llmVerdict']>,
+    vetoOnReject: boolean,
+    observerMode = false,
+  ): void {
+    const sc = this.activeScenarios.find(s => s.id === scenarioId);
+    if (!sc) return; // déjà sorti (SL/expiré) pendant la review
+    if (sc.status !== 'PENDING' && sc.status !== 'ACTIVE') return;
+
+    sc.llmVerdict = verdict;
+    sc.updatedAt = clock.now();
+
+    // Mode observateur (audit 2026-07-11 : sur 14 verdicts, APPROVE = -2.01R cumulé
+    // vs REJECT = +0.52R — l'inverse de l'objectif). Le verdict est attaché, affiché
+    // et loggé pour mesurer son edge réel SANS contaminer la sélection : zéro
+    // modulation de score/priorité tant qu'un edge n'est pas prouvé sur n>=30.
+    if (observerMode) {
+      this.emit('scenario:update', sc);
+      return;
+    }
+
+    if (verdict.verdict === 'REDUCE') {
+      sc.score = Math.round(sc.score * 0.85);
+      if (sc.priority === 'EXTREME') sc.priority = 'HIGH';
+      else if (sc.priority === 'HIGH') sc.priority = 'MEDIUM';
+    } else if (verdict.verdict === 'REJECT') {
+      sc.priority = 'LOW';
+      if (vetoOnReject) {
+        sc.status = 'INVALIDATED';
+        sc.invalidationReason = `Risk Desk REJECT (${verdict.confidence}%): ${verdict.riskNotes}`;
+        sc.exitTime = clock.now();
+        sc.exitReason = sc.invalidationReason;
+        this.emit('scenario:invalidated', sc);
+        this.logOutcome(sc);
+        this.activeScenarios = this.activeScenarios.filter(s => s.id !== sc.id);
+        return;
+      }
+    }
+
+    this.emit('scenario:update', sc);
   }
 
   getActiveScenarios(): TradeScenario[] {
@@ -330,7 +610,7 @@ export class ConfluenceEngine {
   // ═══════════════════════════════════════════════════════════
 
   private pruneOldSignals(): void {
-    const now = Date.now();
+    const now = clock.now();
     this.signals = this.signals.filter(s => {
       const ttl = SCENARIO_CONFIG.SIGNAL_TTL_MS[s.type] ?? SCENARIO_CONFIG.DEFAULT_SIGNAL_TTL_MS;
       return (now - s.timestamp) <= ttl;
@@ -345,16 +625,30 @@ export class ConfluenceEngine {
     if (this.currentPrice <= 0) return;
     this.evalStats.calls++;
 
+    // Momentum regime: during a directional impulse, no counter-move scenarios
+    const momentumDirection = this.getMomentumRegime();
+
     // Group signals by price zone (within 0.3% of each other)
     const zones = this.groupSignalsByZone();
+    // Seuils effectifs selon le régime de volatilité (constants pour toute la passe)
+    const anchorMinTf = this.anchorMinTfEff();
+    const minScore = this.minScoreEff();
 
     for (const zone of zones) {
       // Determine direction
       const direction = this.determineDirection(zone);
       if (!direction) continue;
 
-      // Phase 3.3: Require at least one anchor signal (weight >= 10)
-      if (!hasAnchorSignal(zone, direction, this.config.weights)) { this.evalStats.noAnchor++; continue; }
+      // Phase 3.3: Require at least one STRUCTURAL anchor signal
+      if (!hasAnchorSignal(zone, direction, this.config.weights, anchorMinTf)) {
+        // Diagnostic : l'ancre existait-elle sur un TF plus bas ? (mesure l'impact réel du gate TF)
+        if (anchorMinTf > 1 && hasAnchorSignal(zone, direction, this.config.weights, 1)) this.evalStats.anchorTfBlocked++;
+        else this.evalStats.noAnchor++;
+        continue;
+      }
+
+      // Regime block: don't catch knives during impulses (the #1 source of instant SLs)
+      if (momentumDirection && direction !== momentumDirection) { this.evalStats.regimeBlocked++; continue; }
 
       // Calculate score (Phase 1.2 strength + Phase 1.5 contra + Phase 3.1 decay/proximity)
       const { score: rawScore, maxScore, contributions } = this.calculateScore(zone, direction);
@@ -364,7 +658,7 @@ export class ConfluenceEngine {
       const scoreWithCluster = rawScore + clusterBonus;
 
       // Phase 1.1: Apply trend multiplier
-      const { adjustedScore, trendScore, trendMultiplier } = this.applyTrendMultiplier(
+      const { adjustedScore: trendAdjusted, trendScore, trendMultiplier } = this.applyTrendMultiplier(
         scoreWithCluster, direction,
       );
 
@@ -378,15 +672,24 @@ export class ConfluenceEngine {
         if (absTrend > SCENARIO_CONFIG.TREND_SOFT_BLOCK_THRESHOLD && rawScore < SCENARIO_CONFIG.COUNTER_TREND_MIN_RAW_SCORE) { this.evalStats.counterBlocked++; continue; }
       }
 
-      if (adjustedScore < this.config.minScoreForScenario) { this.evalStats.lowScore++; continue; }
-
-      // SL cooldown check (TIER 3.2)
-      const timeSinceLastSL = Date.now() - (this.lastSLTimestamp[direction] || 0);
-      if (timeSinceLastSL < SCENARIO_CONFIG.SL_COOLDOWN_MS && adjustedScore < SCENARIO_CONFIG.SL_COOLDOWN_OVERRIDE_SCORE) continue;
-
-      // Try to match a template
+      // Try to match a template (before scoring gate — its historical winrate adjusts the score)
       const template = matchTemplate(zone, direction, contributions);
       if (!template) { this.evalStats.noTemplate++; continue; }
+
+      // Template auto-calibration: templates that historically stop out get penalized
+      const templateModifier = this.getTemplateModifier(template.id);
+      const adjustedScore = Math.round(trendAdjusted * templateModifier);
+
+      if (adjustedScore < minScore) {
+        this.evalStats.lowScore++;
+        // Near-miss : rejets à moins de 10 points du seuil (règle le seuil sur données)
+        if (adjustedScore >= minScore - 10 && this.evalStats.nearMissScores.length < 8) this.evalStats.nearMissScores.push(adjustedScore);
+        continue;
+      }
+
+      // SL cooldown check (TIER 3.2)
+      const timeSinceLastSL = clock.now() - (this.lastSLTimestamp[direction] || 0);
+      if (timeSinceLastSL < SCENARIO_CONFIG.SL_COOLDOWN_MS && adjustedScore < SCENARIO_CONFIG.SL_COOLDOWN_OVERRIDE_SCORE) continue;
 
       // Check if we already have a similar scenario (same template)
       if (this.isDuplicate(template, direction)) { this.evalStats.duplicate++; continue; }
@@ -395,7 +698,12 @@ export class ConfluenceEngine {
       const scenario = this.buildScenario(
         template, direction, adjustedScore, maxScore, contributions, zone,
       );
-      if (!scenario) continue;
+      if (!scenario) {
+        this.evalStats.badZone++;
+        if (this.lastBuildFail === 'zoneBroken') this.evalStats.zoneBroken++;
+        else if (this.lastBuildFail === 'noRoom') this.evalStats.noRoom++;
+        continue;
+      }
 
       // Cross-template dedup by entry zone overlap (TIER 3.1)
       if (this.isDuplicateByZone(direction, scenario.entryLow, scenario.entryHigh, adjustedScore)) continue;
@@ -408,16 +716,25 @@ export class ConfluenceEngine {
         adjustedScore,
         hasAnchorSignal: true,
         clusterBonus,
+        templateModifier,
       };
 
       // Check R:R
-      if (scenario.riskReward < this.config.minRiskReward) { this.evalStats.lowRR++; continue; }
+      if (scenario.riskReward < this.config.minRiskReward) {
+        this.evalStats.lowRR++;
+        if (this.evalStats.nearMissRR.length < 8) this.evalStats.nearMissRR.push(Math.round(scenario.riskReward * 100) / 100);
+        continue;
+      }
 
       // Check max active
       const active = this.getActiveScenarios();
       if (active.length >= this.config.maxActiveScenarios) {
-        // Replace lowest score if new is higher
-        const lowest = active.reduce((min, s) => s.score < min.score ? s : min, active[0]);
+        // Remplacement uniquement parmi les PENDING/ACTIVE : un scénario qui a
+        // déjà touché TP1/TP2 est un gagnant en cours de gestion — l'éjecter
+        // pour faire de la place détruisait des trades gagnants (vu en prod)
+        const replaceable = active.filter(s => s.status === 'PENDING' || s.status === 'ACTIVE');
+        if (replaceable.length === 0) continue;
+        const lowest = replaceable.reduce((min, s) => s.score < min.score ? s : min, replaceable[0]);
         if (adjustedScore <= lowest.score) continue;
         lowest.status = 'INVALIDATED';
         lowest.invalidationReason = 'Replaced by higher-score scenario';
@@ -428,7 +745,7 @@ export class ConfluenceEngine {
 
       this.activeScenarios.push(scenario);
       this.evalStats.emitted++;
-      console.log(`[SCENARIO] NEW ${scenario.direction} "${scenario.templateName}" | raw=${rawScore} trend=${trendScore} mult=${trendMultiplier.toFixed(2)} adj=${adjustedScore} cluster=${clusterBonus} | R:R=${scenario.riskReward} | signals: ${contributions.map(c => c.name).join(', ')}`);
+      if (!this.quiet) console.log(`[SCENARIO] NEW ${scenario.direction} "${scenario.templateName}" | raw=${rawScore} trend=${trendScore} mult=${trendMultiplier.toFixed(2)} adj=${adjustedScore} cluster=${clusterBonus} | R:R=${scenario.riskReward} | signals: ${contributions.map(c => c.name).join(', ')}`);
       this.emit('scenario:new', scenario);
     }
   }
@@ -500,9 +817,15 @@ export class ConfluenceEngine {
     const contributions: SignalContribution[] = [];
     // Track best signal per weight key (for deduplication: keep highest strength)
     const bestByWeightKey = new Map<string, { signal: ConfluenceSignal; effectiveScore: number; weight: number }>();
+    // Contra dédupliqués par catégorie EUX AUSSI — avant, chaque signal
+    // contraire soustrayait individuellement : en live, la douzaine
+    // d'absorptions/vélocités qui traînent en permanence autour du prix
+    // enterrait tout retest sous -20 de pénalités (0 émission en 3 jours),
+    // alors que le côté favorable, lui, était plafonné à 1 signal/catégorie.
+    const worstContraByKey = new Map<string, number>(); // weightKey → pénalité max
     let score = 0;
     let maxScore = 0;
-    const now = Date.now();
+    const now = clock.now();
 
     for (const sig of signals) {
       const weightKey = SIGNAL_WEIGHT_MAP[sig.type] || 'spike';
@@ -519,10 +842,13 @@ export class ConfluenceEngine {
           bestByWeightKey.set(weightKey, { signal: sig, effectiveScore, weight });
         }
       } else {
-        // Contra signal — Phase 1.5: progressive penalty
-        const strength = Math.max(SCENARIO_CONFIG.MIN_STRENGTH_FLOOR, sig.strength ?? 1.0);
+        // Contra signal — Phase 1.5: progressive penalty (strength clampée aussi)
+        const strength = Math.min(1, Math.max(SCENARIO_CONFIG.MIN_STRENGTH_FLOOR, sig.strength ?? 1.0));
         const penaltyRatio = getContraPenaltyRatio(weight);
-        score -= Math.floor(weight * strength * penaltyRatio);
+        const penalty = Math.floor(weight * strength * penaltyRatio);
+        if (penalty > (worstContraByKey.get(weightKey) ?? 0)) {
+          worstContraByKey.set(weightKey, penalty);
+        }
       }
     }
 
@@ -538,6 +864,11 @@ export class ConfluenceEngine {
       });
     }
 
+    // Subtract worst contra per category (symétrique du côté favorable)
+    for (const [, penalty] of worstContraByKey) {
+      score -= penalty;
+    }
+
     return { score: Math.max(0, score), maxScore, contributions };
   }
 
@@ -546,8 +877,10 @@ export class ConfluenceEngine {
   // ═══════════════════════════════════════════════════════════
 
   private computeSignalScore(signal: ConfluenceSignal, baseWeight: number, now: number): number {
-    // 1. Strength (Phase 1.2)
-    const strength = Math.max(SCENARIO_CONFIG.MIN_STRENGTH_FLOOR, signal.strength ?? 1.0);
+    // 1. Strength (Phase 1.2) — clampée dans [floor, 1] : certains émetteurs
+    // envoyaient des forces > 1 (OB strength 0-100 divisé par 5 → jusqu'à 20),
+    // ce qui faisait exploser le score d'un seul signal
+    const strength = Math.min(1, Math.max(SCENARIO_CONFIG.MIN_STRENGTH_FLOOR, signal.strength ?? 1.0));
 
     // 2. Temporal decay: signal loses value as it ages
     const ttl = SCENARIO_CONFIG.SIGNAL_TTL_MS[signal.type] ?? SCENARIO_CONFIG.DEFAULT_SIGNAL_TTL_MS;
@@ -563,7 +896,12 @@ export class ConfluenceEngine {
     // 4. Timeframe multiplier
     const tfMultiplier = SCENARIO_CONFIG.TF_MULTIPLIERS[signal.timeframe || '1m'] ?? 1.0;
 
-    return Math.round(baseWeight * strength * decay * proximity * tfMultiplier);
+    // 5. Retest bonus (refonte v2) — une zone tenue puis retestée vaut plus
+    // que sa création : c'est l'entrée en pullback qu'on cherche
+    const retestMult = SCENARIO_CONFIG.RETEST_TYPES.has(signal.type)
+      ? SCENARIO_CONFIG.RETEST_SCORE_MULTIPLIER : 1.0;
+
+    return Math.round(baseWeight * strength * decay * proximity * tfMultiplier * retestMult);
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -601,7 +939,7 @@ export class ConfluenceEngine {
       s.templateId === template.id &&
       s.direction === direction &&
       (s.status === 'PENDING' || s.status === 'ACTIVE') &&
-      Date.now() - s.createdAt < 120000
+      clock.now() - s.createdAt < 120000
     );
   }
 
@@ -649,7 +987,14 @@ export class ConfluenceEngine {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // Phase 2.1: Wider entry zone / SL
+  // Phase 2.1 (refonte): structural entry zone + honest risk
+  //
+  // The old logic stretched the entry zone to the CURRENT price
+  // (instant market entry), put the SL 1×ATR(1m) behind it (noise),
+  // and measured "risk" across the whole zone width — inflating the
+  // TPs to unreachable levels. Net effect: stops swept, targets never
+  // hit. Now: entry = the anchor's structural zone (pullback entry),
+  // SL = 2×ATR behind the zone, TPs = true R-multiples from entryMid.
   // ═══════════════════════════════════════════════════════════
 
   private buildScenario(
@@ -660,67 +1005,120 @@ export class ConfluenceEngine {
     contributions: SignalContribution[],
     signals: ConfluenceSignal[],
   ): TradeScenario | null {
+    this.lastBuildFail = null;
     const price = this.currentPrice;
-    if (price <= 0) return null;
+    if (price <= 0) { this.lastBuildFail = 'other'; return null; }
 
-    // ATR-based SL or fixed fallback
+    // Entry zone = the structural anchor's zone (OB/FVG bounds, sweep level)
+    const anchor = pickAnchorSignal(signals, direction, this.config.weights, this.anchorMinTfEff());
+    if (!anchor) { this.lastBuildFail = 'other'; return null; }
+
+    // ATR-based SL, scaled to the anchor's timeframe: a 15m zone breathes more
+    // than a 1m one — same 2×ATR(1m) stop for both was noise-tight on higher TFs
+    const tfMinutes: Record<string, number> = { '1m': 1, '5m': 5, '15m': 15, '1h': 60 };
+    const tfScale = Math.sqrt(tfMinutes[anchor.timeframe || '1m'] ?? 1);
     let slBuffer: number;
     if (SCENARIO_CONFIG.SL_MODE === 'ATR' && this.currentATR > 0) {
       slBuffer = Math.max(
         price * SCENARIO_CONFIG.MIN_SL_BUFFER_PCT,
-        this.currentATR * SCENARIO_CONFIG.ATR_SL_MULTIPLIER,
+        this.currentATR * SCENARIO_CONFIG.ATR_SL_MULTIPLIER * tfScale,
       );
     } else {
-      slBuffer = price * (this.config.slBufferPercent / 100);
+      slBuffer = price * (this.config.slBufferPercent / 100) * tfScale;
     }
     const entryBuffer = price * SCENARIO_CONFIG.ENTRY_BUFFER_PCT;
 
-    // Find zone bounds from signals
-    const zonePrices = signals.map(s => s.price);
-    const zoneLow = Math.min(...zonePrices, ...signals.filter(s => s.zoneLow).map(s => s.zoneLow!));
-    const zoneHigh = Math.max(...zonePrices, ...signals.filter(s => s.zoneHigh).map(s => s.zoneHigh!));
+    let zoneLow = anchor.zoneLow ?? anchor.price;
+    let zoneHigh = anchor.zoneHigh ?? anchor.price;
+    // Degenerate zone (single level): pad to a tradeable band
+    if (zoneHigh - zoneLow < price * 0.0005) {
+      const pad = price * 0.0005;
+      zoneLow -= pad;
+      zoneHigh += pad;
+    }
+    // Clamp zones wider than MAX_ENTRY_ZONE_PCT (keeps risk meaningful)
+    const maxWidth = price * SCENARIO_CONFIG.MAX_ENTRY_ZONE_PCT;
+    if (zoneHigh - zoneLow > maxWidth) {
+      const mid = (zoneLow + zoneHigh) / 2;
+      zoneLow = mid - maxWidth / 2;
+      zoneHigh = mid + maxWidth / 2;
+    }
 
-    let entryLow: number, entryHigh: number, stopLoss: number;
-    let tp1: number, tp2: number, tp3: number;
+    const entryLow = zoneLow - entryBuffer;
+    const entryHigh = zoneHigh + entryBuffer;
+    const entryMid = (entryLow + entryHigh) / 2;
+
+    let stopLoss: number;
     let invalidationPrice: number;
 
     if (direction === 'LONG') {
-      entryLow = Math.min(zoneLow, price) - entryBuffer;
-      entryHigh = Math.max(zoneHigh, price) + entryBuffer;
+      // Zone already broken below → setup is dead, don't emit
+      if (price < entryLow) { this.lastBuildFail = 'zoneBroken'; return null; }
       stopLoss = entryLow - slBuffer;
-      const risk = entryHigh - stopLoss;
-      tp1 = entryHigh + risk * SCENARIO_CONFIG.TP1_MULTIPLIER;
-      tp2 = entryHigh + risk * SCENARIO_CONFIG.TP2_MULTIPLIER;
-      tp3 = entryHigh + risk * SCENARIO_CONFIG.TP3_MULTIPLIER;
-      invalidationPrice = stopLoss - slBuffer;
     } else {
-      entryLow = Math.min(zoneLow, price) - entryBuffer;
-      entryHigh = Math.max(zoneHigh, price) + entryBuffer;
+      // Zone already broken above → setup is dead
+      if (price > entryHigh) { this.lastBuildFail = 'zoneBroken'; return null; }
       stopLoss = entryHigh + slBuffer;
-      const risk = stopLoss - entryLow;
-      tp1 = entryLow - risk * SCENARIO_CONFIG.TP1_MULTIPLIER;
-      tp2 = entryLow - risk * SCENARIO_CONFIG.TP2_MULTIPLIER;
-      tp3 = entryLow - risk * SCENARIO_CONFIG.TP3_MULTIPLIER;
-      invalidationPrice = stopLoss + slBuffer;
+    }
+    invalidationPrice = stopLoss;
+    const risk = Math.abs(entryMid - stopLoss);
+
+    // ── TP structurels (refonte v2) ──
+    // Les R-multiples aveugles visaient À TRAVERS le premier niveau opposé
+    // (pool de liquidité, POC, swing) — là où le trade meurt à 0.9R. On cappe
+    // chaque TP juste devant les niveaux, et on rejette s'il n'y a pas de place.
+    const sign = direction === 'LONG' ? 1 : -1;
+    const pad = Math.max(price * 0.0002, this.currentATR * SCENARIO_CONFIG.TP_LEVEL_PADDING_ATR);
+    const opposing = this.marketLevels
+      .filter(l => sign * (l - entryMid) > 0 && (direction === 'LONG' ? l > entryHigh : l < entryLow))
+      .sort((a, b) => sign * (a - b));
+
+    // Pas de place jusqu'au premier niveau opposé → pas de trade
+    if (opposing.length > 0 && sign * (opposing[0] - entryMid) - pad < risk * SCENARIO_CONFIG.MIN_ROOM_TO_FIRST_LEVEL_R) {
+      this.lastBuildFail = 'noRoom';
+      return null;
     }
 
-    // Calculate R:R to TP2
-    const entryMid = (entryLow + entryHigh) / 2;
-    const riskAmt = Math.abs(entryMid - stopLoss);
+    const tpMultipliers = [
+      SCENARIO_CONFIG.TP1_MULTIPLIER,
+      SCENARIO_CONFIG.TP2_MULTIPLIER,
+      SCENARIO_CONFIG.TP3_MULTIPLIER,
+    ];
+    const tps: number[] = [];
+    let levelIdx = 0;
+    for (const mult of tpMultipliers) {
+      let target = entryMid + sign * risk * mult;
+      // Avance jusqu'au prochain niveau strictement au-delà du TP précédent
+      const prevTp = tps.length > 0 ? tps[tps.length - 1] : entryMid;
+      while (levelIdx < opposing.length && sign * (opposing[levelIdx] - prevTp) <= pad) levelIdx++;
+      if (levelIdx < opposing.length && sign * (opposing[levelIdx] - entryMid) - pad < sign * (target - entryMid)) {
+        target = opposing[levelIdx] - sign * pad;
+        levelIdx++;
+      }
+      // Garantit une progression strictement croissante des cibles
+      if (tps.length > 0 && sign * (target - tps[tps.length - 1]) <= 0) {
+        target = tps[tps.length - 1] + sign * risk * 0.5;
+      }
+      tps.push(target);
+    }
+    const [tp1, tp2, tp3] = tps;
+
+    // R:R réel vers TP2 — de nouveau significatif maintenant que TP2 est cappé
+    const riskAmt = risk;
     const rewardAmt = Math.abs(tp2 - entryMid);
     const rr = riskAmt > 0 ? rewardAmt / riskAmt : 0;
 
-    // Determine priority (LOW≥40, MEDIUM≥50, HIGH≥60, EXTREME≥75)
+    // Priorité : LOW par défaut, MEDIUM≥50, HIGH≥highPriorityThreshold, EXTREME≥extremePriorityThreshold
     let priority: ScenarioPriority = 'LOW';
     if (score >= this.config.extremePriorityThreshold) priority = 'EXTREME';
     else if (score >= this.config.highPriorityThreshold) priority = 'HIGH';
     else if (score >= 50) priority = 'MEDIUM';
 
-    // Determine timeframe
-    const tfSignal = signals.find(s => s.timeframe);
-    const timeframe = tfSignal?.timeframe || '1m';
+    // Le timeframe du scénario est celui de l'ANCRE (avant : premier signal
+    // venu, ce qui étiquetait "1m" des trades ancrés sur des zones 15m)
+    const timeframe = anchor.timeframe || signals.find(s => s.timeframe)?.timeframe || '1m';
 
-    const now = Date.now();
+    const now = clock.now();
     return {
       id: `SC-${now}-${Math.random().toString(36).slice(2, 6)}`,
       templateName: template.name,
@@ -733,6 +1131,7 @@ export class ConfluenceEngine {
       entryLow,
       entryHigh,
       stopLoss,
+      initialStopLoss: stopLoss, // le SL traîne (breakeven/TP1) — le risque initial sert au calcul du R
       tp1,
       tp2,
       tp3,
@@ -752,22 +1151,33 @@ export class ConfluenceEngine {
   // ═══════════════════════════════════════════════════════════
 
   private updateScenarioLifecycle(): void {
-    const now = Date.now();
+    const now = clock.now();
     const price = this.currentPrice;
 
     for (const sc of this.activeScenarios) {
       if (sc.status === 'INVALIDATED' || sc.status === 'EXPIRED' || sc.status === 'TP3_HIT') continue;
 
-      // Expiration: low-score expire at expiresAt, ALL expire at absolute max TTL
-      const adjScore = sc.meta?.adjustedScore ?? sc.score;
+      // Expiration: PENDING expires at expiresAt (no score exemption — stale
+      // setups used to linger 2h), everything dies at the absolute max TTL
       const age = now - sc.createdAt;
-      const normalExpiry = now >= sc.expiresAt && adjScore < 40;
+      const normalExpiry = sc.status === 'PENDING' && now >= sc.expiresAt;
       const absoluteExpiry = age >= SCENARIO_CONFIG.MAX_SCENARIO_TTL_MS;
 
       if ((sc.status === 'PENDING' || sc.status === 'ACTIVE') && (normalExpiry || absoluteExpiry)) {
         sc.status = 'EXPIRED';
         sc.exitTime = now;
         sc.exitReason = absoluteExpiry ? 'Max TTL reached' : 'Expired';
+        this.emit('scenario:expired', sc);
+        this.logOutcome(sc);
+        continue;
+      }
+
+      // Time stop: ACTIVE without TP1 for too long → dead trade, free the slot
+      if (sc.status === 'ACTIVE' && sc.activatedAt && now - sc.activatedAt >= SCENARIO_CONFIG.ACTIVE_TIME_STOP_MS) {
+        sc.status = 'EXPIRED';
+        sc.exitPrice = price;
+        sc.exitTime = now;
+        sc.exitReason = 'Time stop — no TP1 within window';
         this.emit('scenario:expired', sc);
         this.logOutcome(sc);
         continue;
@@ -795,12 +1205,35 @@ export class ConfluenceEngine {
           this.logOutcome(sc);
           continue;
         }
+
+        // Missed entry: price ran toward the targets without ever retesting
+        // the zone — the setup played out without us, cancel it cleanly
+        const risk = Math.abs((sc.entryLow + sc.entryHigh) / 2 - sc.stopLoss);
+        const missedLevel = sc.direction === 'LONG'
+          ? sc.entryHigh + risk * SCENARIO_CONFIG.MISSED_ENTRY_R
+          : sc.entryLow - risk * SCENARIO_CONFIG.MISSED_ENTRY_R;
+        const missed = sc.direction === 'LONG' ? price >= missedLevel : price <= missedLevel;
+        if (missed) {
+          sc.status = 'EXPIRED';
+          sc.exitPrice = price;
+          sc.exitTime = now;
+          sc.exitReason = 'Missed entry — price ran without retest';
+          this.emit('scenario:expired', sc);
+          this.logOutcome(sc);
+          continue;
+        }
       }
 
       // PENDING → ACTIVE: price enters entry zone
       if (sc.status === 'PENDING') {
         if (price >= sc.entryLow && price <= sc.entryHigh) {
           sc.status = 'ACTIVE';
+          sc.activatedAt = now;
+          // Le fill réel : le prix peut entrer par n'importe quel bord de la
+          // zone (ou être déjà dedans à la création) — mesurer les TP/R depuis
+          // le milieu théorique gonflait les résultats (« TP1 touché » alors
+          // que l'entrée réelle était déjà à 100 pts du TP)
+          sc.activationPrice = price;
           sc.updatedAt = now;
           this.emit('scenario:update', sc);
         }
@@ -920,6 +1353,54 @@ export class ConfluenceEngine {
   }
 
   // ═══════════════════════════════════════════════════════════
+  // Template auto-calibration: learn from logged outcomes.
+  // Templates whose entries historically stop out before TP1 get
+  // their score penalized; consistent winners get a small boost.
+  // ═══════════════════════════════════════════════════════════
+
+  private loadTemplateStats(): void {
+    try {
+      const logPath = SCENARIO_CONFIG.SCENARIO_LOG_PATH;
+      if (!existsSync(logPath)) return;
+      const lines = readFileSync(logPath, 'utf-8').trim().split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const o = JSON.parse(line);
+          this.recordTemplateOutcome(o.templateId, o.tp1Hit === true, String(o.exitReason || ''));
+        } catch { /* skip malformed lines */ }
+      }
+      const summary = Array.from(this.templateStats.entries())
+        .map(([id, s]) => `T${id}:${s.wins}W/${s.losses}L(x${this.getTemplateModifier(id).toFixed(2)})`)
+        .join(' ');
+      if (summary) console.log(`[SCENARIO] Template calibration loaded: ${summary}`);
+    } catch (err) {
+      console.warn('[SCENARIO] Failed to load template stats:', (err as Error).message);
+    }
+  }
+
+  /** Count only decisive outcomes: TP1 reached = win, stop-loss = loss */
+  private recordTemplateOutcome(templateId: number, tp1Hit: boolean, exitReason: string): void {
+    if (typeof templateId !== 'number') return;
+    const isLoss = !tp1Hit && exitReason.includes('Stop-loss');
+    if (!tp1Hit && !isLoss) return; // expired/missed/replaced = no information
+    const stats = this.templateStats.get(templateId) ?? { wins: 0, losses: 0 };
+    if (tp1Hit) stats.wins++;
+    else stats.losses++;
+    this.templateStats.set(templateId, stats);
+  }
+
+  private getTemplateModifier(templateId: number): number {
+    const stats = this.templateStats.get(templateId);
+    if (!stats) return 1.0;
+    const n = stats.wins + stats.losses;
+    if (n < SCENARIO_CONFIG.TEMPLATE_STATS_MIN_N) return 1.0;
+    const winrate = stats.wins / n;
+    const modifier = 1 + (winrate - SCENARIO_CONFIG.TEMPLATE_BASELINE_WINRATE) * 0.8;
+    return Math.min(SCENARIO_CONFIG.TEMPLATE_MODIFIER_MAX,
+      Math.max(SCENARIO_CONFIG.TEMPLATE_MODIFIER_MIN, modifier));
+  }
+
+  // ═══════════════════════════════════════════════════════════
   // Phase 4.1: Scenario outcome logging
   // ═══════════════════════════════════════════════════════════
 
@@ -945,7 +1426,12 @@ export class ConfluenceEngine {
         hasAnchorSignal: scenario.meta?.hasAnchorSignal ?? false,
         clusterBonus: scenario.meta?.clusterBonus ?? 0,
         entryMid: (scenario.entryLow + scenario.entryHigh) / 2,
+        activationPrice: scenario.activationPrice ?? null,
         sl: scenario.stopLoss,
+        initialSl: scenario.initialStopLoss ?? scenario.stopLoss,
+        // Risque mesuré depuis le fill réel quand il existe (comptabilité honnête)
+        initialRisk: Math.abs((scenario.activationPrice ?? (scenario.entryLow + scenario.entryHigh) / 2) - (scenario.initialStopLoss ?? scenario.stopLoss)),
+        wasActive: scenario.activatedAt != null,
         tp1: scenario.tp1,
         tp2: scenario.tp2,
         tp3: scenario.tp3,
@@ -953,7 +1439,7 @@ export class ConfluenceEngine {
         exitPrice: scenario.exitPrice ?? null,
         exitTime: scenario.exitTime ?? null,
         exitReason: scenario.exitReason ?? scenario.invalidationReason ?? '',
-        durationMs: (scenario.exitTime ?? Date.now()) - scenario.createdAt,
+        durationMs: (scenario.exitTime ?? clock.now()) - scenario.createdAt,
         maxFavorableExcursion: scenario.maxFavorableExcursion ?? null,
         maxAdverseExcursion: scenario.maxAdverseExcursion ?? null,
         tp1Hit: scenario.tp1HitTime != null,
@@ -962,15 +1448,28 @@ export class ConfluenceEngine {
         hourOfDay: new Date(scenario.createdAt).getUTCHours(),
         dayOfWeek: new Date(scenario.createdAt).getUTCDay(),
         timeframe: scenario.timeframe,
+        // Verdict Risk Desk (si review LLM) — permet de mesurer son apport
+        llmVerdict: scenario.llmVerdict?.verdict ?? null,
+        llmConfidence: scenario.llmVerdict?.confidence ?? null,
       };
 
-      appendFileSync(logPath, JSON.stringify(outcome) + '\n');
+      // Feed the calibration loop, then write asynchronously — synchronous
+      // writes here used to stall the event loop during scenario churn
+      this.recordTemplateOutcome(outcome.templateId, outcome.tp1Hit, outcome.exitReason);
+      if (this.outcomeSink) {
+        this.outcomeSink(outcome); // backtest : collecte en mémoire, pas de fichier
+        return;
+      }
+      appendFile(logPath, JSON.stringify(outcome) + '\n', (err) => {
+        if (err) console.warn('[SCENARIO_LOG] Failed to write outcome:', err.message);
+      });
     } catch (err) {
       console.warn('[SCENARIO_LOG] Failed to write outcome:', (err as Error).message);
     }
   }
 
   private emit(event: string, scenario: TradeScenario): void {
+    this.stateDirty = true; // any scenario event implies state changed
     if (this.scenarioCallback) {
       this.scenarioCallback(event, scenario);
     }
@@ -980,24 +1479,39 @@ export class ConfluenceEngine {
   // Phase 5: Active scenario persistence (survive restarts)
   // ═══════════════════════════════════════════════════════════
 
-  /** Save active scenarios to disk */
+  private buildStatePayload(): string {
+    const active = this.activeScenarios.filter(s =>
+      s.status === 'PENDING' || s.status === 'ACTIVE' ||
+      s.status === 'TRIGGERED' || s.status === 'TP1_HIT' ||
+      s.status === 'TP2_HIT'
+    );
+    return JSON.stringify({ savedAt: clock.now(), scenarios: active }, null, 2);
+  }
+
+  /** Synchronous save — ONLY for shutdown (blocks the event loop) */
   saveState(): void {
     try {
       const filePath = SCENARIO_CONFIG.ACTIVE_SCENARIOS_PATH;
       const dir = dirname(filePath);
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-
-      const active = this.activeScenarios.filter(s =>
-        s.status === 'PENDING' || s.status === 'ACTIVE' ||
-        s.status === 'TRIGGERED' || s.status === 'TP1_HIT' ||
-        s.status === 'TP2_HIT'
-      );
-
-      writeFileSync(filePath, JSON.stringify({
-        savedAt: Date.now(),
-        scenarios: active,
-      }, null, 2));
+      writeFileSync(filePath, this.buildStatePayload());
+      this.stateDirty = false;
     } catch (err) {
+      console.warn('[SCENARIO] Failed to save active state:', (err as Error).message);
+    }
+  }
+
+  /** Async save used by the periodic saver — never blocks trade processing */
+  private async saveStateAsync(): Promise<void> {
+    try {
+      const filePath = SCENARIO_CONFIG.ACTIVE_SCENARIOS_PATH;
+      const dir = dirname(filePath);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      const payload = this.buildStatePayload();
+      this.stateDirty = false;
+      await fsp.writeFile(filePath, payload);
+    } catch (err) {
+      this.stateDirty = true;
       console.warn('[SCENARIO] Failed to save active state:', (err as Error).message);
     }
   }
@@ -1013,14 +1527,13 @@ export class ConfluenceEngine {
 
       if (!data.scenarios || !Array.isArray(data.scenarios)) return 0;
 
-      const now = Date.now();
+      const now = clock.now();
       let restored = 0;
 
       for (const sc of data.scenarios) {
         // Skip if already expired (expiresAt passed or max TTL reached while server was down)
-        const adjScore = sc.meta?.adjustedScore ?? sc.score;
         const age = now - sc.createdAt;
-        const normalExpiry = sc.expiresAt && now >= sc.expiresAt && adjScore < 40;
+        const normalExpiry = sc.status === 'PENDING' && sc.expiresAt && now >= sc.expiresAt;
         const absoluteExpiry = age >= SCENARIO_CONFIG.MAX_SCENARIO_TTL_MS;
         if ((sc.status === 'PENDING' || sc.status === 'ACTIVE') && (normalExpiry || absoluteExpiry)) {
           sc.status = 'EXPIRED';
@@ -1029,6 +1542,9 @@ export class ConfluenceEngine {
           this.logOutcome(sc);
           continue;
         }
+
+        // Restored ACTIVE scenarios need activatedAt or the time stop never fires
+        if (sc.status === 'ACTIVE' && !sc.activatedAt) sc.activatedAt = sc.createdAt;
 
         // TP-hit scenarios (TP1_HIT, TP2_HIT) don't expire — always restore
         this.activeScenarios.push(sc);
@@ -1046,9 +1562,11 @@ export class ConfluenceEngine {
     }
   }
 
-  /** Start periodic state saving */
+  /** Start periodic state saving (async, only when something changed) */
   startStatePersistence(): void {
-    setInterval(() => this.saveState(), SCENARIO_CONFIG.STATE_SAVE_INTERVAL_MS);
-    console.log(`[SCENARIO] State persistence active (every ${SCENARIO_CONFIG.STATE_SAVE_INTERVAL_MS / 1000}s)`);
+    setInterval(() => {
+      if (this.stateDirty) void this.saveStateAsync();
+    }, SCENARIO_CONFIG.STATE_SAVE_INTERVAL_MS);
+    console.log(`[SCENARIO] State persistence active (every ${SCENARIO_CONFIG.STATE_SAVE_INTERVAL_MS / 1000}s, dirty-flag)`);
   }
 }

@@ -51,7 +51,7 @@ export class ExhaustionDetector {
         latestTrade.market,
         latestTrade.symbol,
         `Bullish Exhaustion! ${key} dropped $${priceDropUsd.toFixed(2)} on mere ${formatUsd(totalVolume)} volume. Sellers exhausted.`,
-        { priceDropUsd, totalVolume, strength },
+        { priceDropUsd, totalVolume, strength, impliedDirection: 'LONG' },
       );
     }
 
@@ -65,7 +65,7 @@ export class ExhaustionDetector {
         latestTrade.market,
         latestTrade.symbol,
         `Bearish Exhaustion! ${key} rose $${priceRiseUsd.toFixed(2)} on mere ${formatUsd(totalVolume)} volume. Buyers exhausted.`,
-        { priceRiseUsd, totalVolume, strength },
+        { priceRiseUsd, totalVolume, strength, impliedDirection: 'SHORT' },
       );
     }
 

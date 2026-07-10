@@ -16,15 +16,21 @@ export class BybitConnector extends BaseExchangeConnector {
     const url = 'wss://stream.bybit.com/v5/public/spot';
 
     this.createWebSocket(url, 'spot', (ws) => {
+      // Depth 25 does not exist in v5 (spot: 1/50/200) — Bybit rejected the
+      // ENTIRE subscribe request including trades, silently freezing this feed
       ws.send(JSON.stringify({
         op: 'subscribe',
-        args: ['publicTrade.BTCUSDT', 'orderbook.25.BTCUSDT'],
+        args: ['publicTrade.BTCUSDT', 'orderbook.50.BTCUSDT'],
       }));
       this.startBybitHeartbeat(ws, 'spot');
     }, (data) => {
       if (data.op === 'ping') {
         const ws = this.connections.get('spot');
         if (ws?.readyState === 1) ws.send(JSON.stringify({ op: 'pong' }));
+        return;
+      }
+      if (data.op === 'subscribe' && data.success === false) {
+        console.error(`[BYBIT] spot subscribe rejected: ${data.ret_msg}`);
         return;
       }
       if (data.op === 'pong' || data.op === 'subscribe') return;
@@ -40,9 +46,11 @@ export class BybitConnector extends BaseExchangeConnector {
     const url = 'wss://stream.bybit.com/v5/public/linear';
 
     this.createWebSocket(url, 'perp', (ws) => {
+      // allLiquidation replaced the deprecated liquidation.* topic;
+      // depth 50 (25 is invalid in v5 and poisoned the whole subscription)
       ws.send(JSON.stringify({
         op: 'subscribe',
-        args: ['publicTrade.BTCUSDT', 'orderbook.25.BTCUSDT', 'liquidation.BTCUSDT'],
+        args: ['publicTrade.BTCUSDT', 'orderbook.50.BTCUSDT', 'allLiquidation.BTCUSDT'],
       }));
       this.startBybitHeartbeat(ws, 'perp');
     }, (data) => {
@@ -51,12 +59,16 @@ export class BybitConnector extends BaseExchangeConnector {
         if (ws?.readyState === 1) ws.send(JSON.stringify({ op: 'pong' }));
         return;
       }
+      if (data.op === 'subscribe' && data.success === false) {
+        console.error(`[BYBIT] perp subscribe rejected: ${data.ret_msg}`);
+        return;
+      }
       if (data.op === 'pong' || data.op === 'subscribe') return;
       if (data.topic?.startsWith('publicTrade')) {
         this.handleTrades(data, 'PERP');
       } else if (data.topic?.startsWith('orderbook')) {
         this.handleOrderBook(data, 'PERP');
-      } else if (data.topic?.startsWith('liquidation')) {
+      } else if (data.topic?.startsWith('allLiquidation') || data.topic?.startsWith('liquidation')) {
         this.handleLiquidation(data);
       }
     });
@@ -91,32 +103,68 @@ export class BybitConnector extends BaseExchangeConnector {
     }
   }
 
+  // Bybit v5 sends one 'snapshot' then 'delta' messages containing ONLY the
+  // changed levels (size "0" = remove). Treating every message as a full book
+  // replaced the order book with 2-3 levels on each delta — garbage data that
+  // fed the trend analyzer's imbalance factor and the heatmap.
+  private books = new Map<string, OrderBook>();
+
   private handleOrderBook(data: any, market: string) {
     if (!data.data) return;
     const d = data.data;
-    const book: OrderBook = {
-      exchange: 'BYBIT',
-      market,
-      symbol: 'BTCUSDT',
-      bids: new Map((d.b || []).map((b: string[]) => [parseFloat(b[0]), parseFloat(b[1])])),
-      asks: new Map((d.a || []).map((a: string[]) => [parseFloat(a[0]), parseFloat(a[1])])),
-      lastUpdate: parseInt(d.ts) || Date.now(),
-    };
+    const key = `BYBIT:${market}`;
+
+    let book = this.books.get(key);
+    if (data.type === 'snapshot' || !book) {
+      book = {
+        exchange: 'BYBIT',
+        market,
+        symbol: 'BTCUSDT',
+        bids: new Map(),
+        asks: new Map(),
+        lastUpdate: 0,
+      };
+      this.books.set(key, book);
+      book.bids.clear();
+      book.asks.clear();
+    }
+
+    for (const [priceStr, sizeStr] of (d.b || []) as string[][]) {
+      const price = parseFloat(priceStr);
+      const size = parseFloat(sizeStr);
+      if (size === 0) book.bids.delete(price);
+      else book.bids.set(price, size);
+    }
+    for (const [priceStr, sizeStr] of (d.a || []) as string[][]) {
+      const price = parseFloat(priceStr);
+      const size = parseFloat(sizeStr);
+      if (size === 0) book.asks.delete(price);
+      else book.asks.set(price, size);
+    }
+    book.lastUpdate = parseInt(d.ts ?? data.ts) || Date.now();
     this.emitOrderBook(book);
   }
 
   private handleLiquidation(data: any) {
     if (!data.data) return;
-    const d = data.data;
-    const liq: Liquidation = {
-      exchange: 'BYBIT',
-      symbol: 'BTCUSDT',
-      side: d.side === 'Sell' ? 'LONG' : 'SHORT',
-      price: parseFloat(d.price),
-      quantity: parseFloat(d.size),
-      usdValue: parseFloat(d.price) * parseFloat(d.size),
-      timestamp: parseInt(d.updatedTime) || Date.now(),
-    };
-    this.emitLiquidation(liq);
+    // allLiquidation pushes an array of {T, s, S, v, p}; the legacy topic
+    // pushed a single {updatedTime, side, size, price} object
+    const entries = Array.isArray(data.data) ? data.data : [data.data];
+    for (const d of entries) {
+      const side = d.S ?? d.side;
+      const price = parseFloat(d.p ?? d.price);
+      const quantity = parseFloat(d.v ?? d.size);
+      if (!isFinite(price) || !isFinite(quantity)) continue;
+      const liq: Liquidation = {
+        exchange: 'BYBIT',
+        symbol: 'BTCUSDT',
+        side: side === 'Sell' ? 'LONG' : 'SHORT',
+        price,
+        quantity,
+        usdValue: price * quantity,
+        timestamp: parseInt(d.T ?? d.updatedTime) || Date.now(),
+      };
+      this.emitLiquidation(liq);
+    }
   }
 }

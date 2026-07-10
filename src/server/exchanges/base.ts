@@ -35,7 +35,10 @@ export abstract class BaseExchangeConnector extends EventEmitter {
       onOpen(ws);
     });
 
+    let lastMessageAt = Date.now();
+
     ws.on('message', (raw: Buffer) => {
+      lastMessageAt = Date.now();
       try {
         const str = raw.toString();
         // OKX sends plain-text "ping" — respond with "pong"
@@ -49,6 +52,8 @@ export abstract class BaseExchangeConnector extends EventEmitter {
         // Binary or non-JSON messages — ignore
       }
     });
+
+    ws.on('pong', () => { lastMessageAt = Date.now(); });
 
     ws.on('error', (err) => {
       console.error(`[${this.name}] Error on ${id}:`, err.message);
@@ -69,7 +74,23 @@ export abstract class BaseExchangeConnector extends EventEmitter {
       }
     }, 30000);
 
-    ws.on('close', () => clearInterval(pingInterval));
+    // Stale-feed watchdog: a half-open connection (PC sleep, network drop)
+    // never fires 'close' — the feed silently freezes forever. BTC streams
+    // push data continuously, so 60s of total silence means the link is dead:
+    // terminate() forces 'close' and the normal reconnect path takes over.
+    const STALE_FEED_TIMEOUT_MS = 60_000;
+    const watchdog = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - lastMessageAt > STALE_FEED_TIMEOUT_MS) {
+        console.warn(`[${this.name}] ${id} silent for ${STALE_FEED_TIMEOUT_MS / 1000}s — terminating to force reconnect`);
+        ws.terminate();
+      }
+    }, 15_000);
+
+    ws.on('close', () => {
+      clearInterval(pingInterval);
+      clearInterval(watchdog);
+    });
 
     return ws;
   }

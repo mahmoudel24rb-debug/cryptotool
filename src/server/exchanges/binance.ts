@@ -3,13 +3,69 @@ import { BaseExchangeConnector } from './base';
 import { ExchangeConfig, NormalizedTrade, OrderBook, Liquidation } from './types';
 
 export class BinanceConnector extends BaseExchangeConnector {
+  // REST fallback for futures trades: some TLS-inspecting middleboxes
+  // (e.g. Avast Web Shield) silently swallow specific fstream streams
+  // (aggTrade/markPrice/kline) while REST passes fine. If the WS stays
+  // silent, we poll /fapi/v1/aggTrades; we hand back to the WS when it revives.
+  private lastFuturesWsTradeAt = 0;
+  private futuresPollCursor: number | null = null;
+  private futuresPollActive = false;
+  private futuresPollBusy = false;
+
   constructor(config: ExchangeConfig) {
     super('BINANCE', config);
   }
 
   connect() {
     if (this.config.spot) this.connectSpot();
-    if (this.config.perp) this.connectFutures();
+    if (this.config.perp) {
+      this.connectFutures();
+      this.startFuturesTradeFallback();
+    }
+  }
+
+  private startFuturesTradeFallback() {
+    const WS_SILENT_THRESHOLD_MS = 20_000; // BTC futures never stay silent that long
+    this.lastFuturesWsTradeAt = Date.now(); // grace period at startup
+
+    setInterval(async () => {
+      const wsSilent = Date.now() - this.lastFuturesWsTradeAt > WS_SILENT_THRESHOLD_MS;
+
+      if (!wsSilent) {
+        if (this.futuresPollActive) {
+          this.futuresPollActive = false;
+          console.log('[BINANCE] Futures WS revived — stopping REST fallback');
+        }
+        return;
+      }
+
+      if (!this.futuresPollActive) {
+        this.futuresPollActive = true;
+        console.warn('[BINANCE] Futures WS silent — polling /fapi/v1/aggTrades as fallback');
+      }
+      if (this.futuresPollBusy) return;
+      this.futuresPollBusy = true;
+
+      try {
+        let url = 'https://fapi.binance.com/fapi/v1/aggTrades?symbol=BTCUSDT&limit=1000';
+        if (this.futuresPollCursor != null) url += `&fromId=${this.futuresPollCursor + 1}`;
+        const res = await fetch(url);
+        if (res.ok) {
+          const json = await res.json();
+          if (Array.isArray(json)) {
+            for (const t of json) {
+              if (this.futuresPollCursor != null && t.a <= this.futuresPollCursor) continue;
+              this.futuresPollCursor = t.a;
+              this.handleFuturesTrade({ p: t.p, q: t.q, m: t.m, T: t.T, fromPoll: true });
+            }
+          }
+        }
+      } catch (err: any) {
+        console.warn(`[BINANCE] Futures REST fallback error: ${err.message}`);
+      } finally {
+        this.futuresPollBusy = false;
+      }
+    }, 2_000);
   }
 
   private connectSpot() {
@@ -59,6 +115,8 @@ export class BinanceConnector extends BaseExchangeConnector {
   }
 
   private handleFuturesTrade(data: any) {
+    // Track WS liveness (poll-sourced trades don't count)
+    if (!data.fromPoll) this.lastFuturesWsTradeAt = Date.now();
     const trade: NormalizedTrade = {
       exchange: 'BINANCE_FUTURES',
       market: 'PERP',
@@ -68,6 +126,7 @@ export class BinanceConnector extends BaseExchangeConnector {
       side: data.m ? 'SELL' : 'BUY',
       timestamp: data.T || data.E,
       usdValue: parseFloat(data.p) * parseFloat(data.q),
+      ...(data.fromPoll ? { source: 'REST' as const } : {}),
     };
     this.emitTrade(trade);
   }

@@ -1,5 +1,6 @@
 import { Candle } from '../candles/candleBuilder';
 import { LiquidityPool, LiquiditySweep, LiquidityConfig, SwingPoint } from './types';
+import { clock } from '../clock';
 
 const MAX_POOLS = 40;
 const MAX_SWEEPS = 30;
@@ -55,12 +56,16 @@ export class LiquidityDetector {
 
       if (group.length >= this.config.minTouches) {
         const avgPrice = group.reduce((s, p) => s + p.price, 0) / group.length;
+        // Cherche AUSSI parmi les pools balayés : un pool swept au même niveau
+        // se recréait à la bougie suivante et se faisait re-balayer en boucle
+        // (des dizaines de milliers de faux signaux SWEEP par mois)
         const existingPool = this.pools.find(
-          p => p.type === type && !p.swept &&
+          p => p.type === type &&
           Math.abs(p.level - avgPrice) / avgPrice <= threshold
         );
 
         if (existingPool) {
+          if (existingPool.swept) continue; // niveau consommé — pas de renaissance avant purge
           // Update existing pool
           existingPool.strength = group.length;
           existingPool.levels = group.map(g => g.price);
@@ -105,10 +110,10 @@ export class LiquidityDetector {
           const sweepDepth = maxWick - pool.level;
 
           pool.swept = true;
-          pool.sweptAt = Math.floor(Date.now() / 1000);
+          pool.sweptAt = Math.floor(clock.now() / 1000);
 
           const sweep: LiquiditySweep = {
-            id: `SWEEP-${this.timeframe}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            id: `SWEEP-${this.timeframe}-${clock.now()}-${Math.random().toString(36).slice(2, 6)}`,
             type: 'BUYSIDE_SWEEP',
             pool,
             sweepPrice: maxWick,
@@ -130,10 +135,10 @@ export class LiquidityDetector {
           const sweepDepth = pool.level - minWick;
 
           pool.swept = true;
-          pool.sweptAt = Math.floor(Date.now() / 1000);
+          pool.sweptAt = Math.floor(clock.now() / 1000);
 
           const sweep: LiquiditySweep = {
-            id: `SWEEP-${this.timeframe}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            id: `SWEEP-${this.timeframe}-${clock.now()}-${Math.random().toString(36).slice(2, 6)}`,
             type: 'SELLSIDE_SWEEP',
             pool,
             sweepPrice: minWick,
@@ -165,10 +170,13 @@ export class LiquidityDetector {
 
   private prunePools(): void {
     // Remove swept pools older than 10 min
-    const cutoff = Math.floor(Date.now() / 1000) - 600;
+    const cutoff = Math.floor(clock.now() / 1000) - 600;
     this.pools = this.pools.filter(p => !p.swept || (p.sweptAt && p.sweptAt > cutoff));
     if (this.pools.length > MAX_POOLS) {
-      this.pools = this.pools.slice(0, MAX_POOLS);
+      // Les nouveaux pools sont push()és en FIN de tableau — slice(0, MAX)
+      // gardait les 40 plus VIEUX : la liste se figeait sur des niveaux
+      // périmés et les pools récents ne rentraient plus jamais
+      this.pools = this.pools.slice(-MAX_POOLS);
     }
   }
 

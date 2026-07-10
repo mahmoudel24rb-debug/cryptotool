@@ -28,6 +28,17 @@ export class OkxConnector extends BaseExchangeConnector {
       }
 
       ws.send(JSON.stringify({ op: 'subscribe', args }));
+
+      // OKX kills connections silent for 30s — app-level text ping required
+      // (the protocol-level ws.ping() doesn't count for them)
+      const okxPing = setInterval(() => {
+        if (ws.readyState === 1) {
+          ws.send('ping');
+        } else {
+          clearInterval(okxPing);
+        }
+      }, 25_000);
+      ws.on('close', () => clearInterval(okxPing));
     }, (data) => {
       if (data.arg?.channel === 'trades') {
         this.handleTrades(data);

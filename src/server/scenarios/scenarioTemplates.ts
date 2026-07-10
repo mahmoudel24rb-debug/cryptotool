@@ -90,6 +90,24 @@ const TEMPLATES: ScenarioTemplate[] = [
     bonusSignals: ['BASIS_EXTREME', 'SPIKE', 'VELOCITY'],
     minRequiredCount: 2,
   },
+  // Refonte v2 : les retests de zones ACTIVES (émis par le feeder de l'engine) —
+  // le pullback dans une zone tenue est l'entrée de référence du système
+  {
+    id: 11,
+    name: 'OB Retest (zone active)',
+    description: 'Le prix revient dans un Order Block actif non mitigé — entrée pullback',
+    requiredSignals: ['OB_RETEST'],
+    bonusSignals: ['ABSORPTION', 'EXHAUSTION', 'DIVERGENCE', 'LIQUIDITY_SWEEP', 'VWAP_POSITION', 'VOLUME_PROFILE'],
+    minRequiredCount: 1,
+  },
+  {
+    id: 12,
+    name: 'FVG Fill (zone active)',
+    description: 'Le prix comble un Fair Value Gap actif — entrée dans l\'imbalance',
+    requiredSignals: ['FVG_FILL'],
+    bonusSignals: ['ABSORPTION', 'EXHAUSTION', 'DIVERGENCE', 'ORDER_BLOCK', 'VWAP_POSITION'],
+    minRequiredCount: 1,
+  },
 ];
 
 // Normalize signal type for matching (handle aliases)

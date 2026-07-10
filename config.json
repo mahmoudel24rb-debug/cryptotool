@@ -13,7 +13,7 @@
     "coinbase": {
       "enabled": true,
       "spot": true,
-      "perp": true
+      "perp": false
     },
     "hyperliquid": {
       "enabled": true,
@@ -121,6 +121,14 @@
     "basisExtremeThresholdPercent": 0.1,
     "basisDivergencePercent": 0.05
   },
+  "llm": {
+    "enabled": true,
+    "model": "claude-opus-4-8",
+    "minScoreForReview": 25,
+    "vetoOnReject": false,
+    "observerMode": true,
+    "timeoutMs": 90000
+  },
   "confluence": {
     "weights": {
       "structure": 15,
@@ -140,13 +148,12 @@
       "vwapPosition": 5,
       "volumeProfile": 5
     },
-    "minScoreForScenario": 30,
+    "minScoreForScenario": 25,
     "highPriorityThreshold": 55,
     "extremePriorityThreshold": 75,
-    "signalTimeWindowMs": 300000,
     "scenarioExpirationMs": 1800000,
-    "maxActiveScenarios": 5,
-    "minRiskReward": 1.5,
-    "slBufferPercent": 0.1
+    "maxActiveScenarios": 4,
+    "minRiskReward": 1.2,
+    "slBufferPercent": 0.25
   }
 }
