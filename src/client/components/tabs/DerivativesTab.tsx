@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef, useEffect, useState } from 'react';
 import { useGlobalState } from '../../hooks/useGlobalState';
 import Chart from '../Chart';
 import ActivityLog from '../ActivityLog';
@@ -10,8 +10,37 @@ const EXCHANGE_SHORT: Record<string, string> = {
   HYPERLIQUID: 'HYP',
 };
 
+// Hauteur minimale de contenu de la grille de panneaux : la colonne OPEN
+// INTEREST est la plus haute (OI + Δ 24h + positionnement). En dessous, la
+// grille défile au lieu de couper le bas.
+const PANELS_MIN_H = 360;
+const LOG_COLLAPSED_H = 34;   // juste l'en-tête du journal
+const LOG_MIN_H = 90;
+const LOG_MAX_H = 520;
+
 export default function DerivativesTab() {
   const { state } = useGlobalState();
+  const [logHeight, setLogHeight] = useState(160);
+  const [collapsed, setCollapsed] = useState(false);
+  const effLogH = collapsed ? LOG_COLLAPSED_H : logHeight;
+
+  // Splitter : glisser vers le HAUT agrandit le journal, vers le BAS le réduit.
+  const startDrag = (e: React.PointerEvent) => {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startH = logHeight;
+    if (collapsed) setCollapsed(false);
+    const move = (ev: PointerEvent) => {
+      const dy = ev.clientY - startY;
+      setLogHeight(Math.max(LOG_MIN_H, Math.min(LOG_MAX_H, startH - dy)));
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
@@ -26,21 +55,50 @@ export default function DerivativesTab() {
         />
       </div>
 
-      {/* Derivatives panels grid */}
-      <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0, gap: 1 }}>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <OIPanel data={state.derivativesData} />
-        </div>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <FundingPanel data={state.derivativesData} />
-        </div>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <BasisPanel data={state.derivativesData} />
+      {/* Derivatives panels grid — défile verticalement si l'espace manque */}
+      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden' }}>
+        <div style={{ display: 'flex', gap: 1, height: '100%', minHeight: PANELS_MIN_H }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <OIPanel data={state.derivativesData} />
+          </div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <FundingPanel data={state.derivativesData} />
+          </div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <BasisPanel data={state.derivativesData} />
+          </div>
         </div>
       </div>
 
+      {/* Splitter redimensionnable + repli du journal */}
+      <div
+        onPointerDown={startDrag}
+        title="Glisser pour redimensionner le journal"
+        style={{
+          position: 'relative', height: 12, flexShrink: 0, cursor: 'ns-resize',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: '#0d1420', borderTop: '1px solid #1e293b', borderBottom: '1px solid #1e293b',
+          userSelect: 'none',
+        }}
+      >
+        <div style={{ width: 44, height: 3, borderRadius: 2, background: '#334155' }} />
+        <button
+          onClick={(e) => { e.stopPropagation(); setCollapsed(c => !c); }}
+          onPointerDown={(e) => e.stopPropagation()}
+          title={collapsed ? 'Déplier le journal' : 'Réduire le journal'}
+          style={{
+            position: 'absolute', right: 6, top: '50%', transform: 'translateY(-50%)',
+            height: 16, width: 22, display: 'flex', alignItems: 'center', justifyContent: 'center',
+            background: '#111a28', border: '1px solid #1e293b', borderRadius: 3,
+            color: '#94a3b8', fontSize: 9, lineHeight: 1, cursor: 'pointer',
+          }}
+        >
+          {collapsed ? '▲' : '▼'}
+        </button>
+      </div>
+
       {/* Bottom: Derivatives Activity Log */}
-      <div style={{ height: 160, flexShrink: 0, borderTop: '1px solid #1e293b' }}>
+      <div style={{ height: effLogH, flexShrink: 0, overflow: 'hidden' }}>
         <ActivityLog alerts={state.alerts} />
       </div>
     </div>
@@ -51,6 +109,7 @@ export default function DerivativesTab() {
 // Backend DerivativesState: { snapshots: [{exchange, openInterest, ...}], aggregateOI, aggregateOIChange, aggregateOIChangePct, ... }
 function OIPanel({ data }: { data: any }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [rev, setRev] = useState(0); // bumpé au resize pour forcer un redraw net
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -249,7 +308,7 @@ function OIPanel({ data }: { data: any }) {
       }
     }
 
-  }, [data]);
+  }, [data, rev]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -260,6 +319,7 @@ function OIPanel({ data }: { data: any }) {
       const r = parent.getBoundingClientRect();
       canvas.style.width = `${r.width}px`;
       canvas.style.height = `${r.height}px`;
+      setRev(v => v + 1); // redessine à la nouvelle taille (sinon flou jusqu'au prochain tick)
     });
     ro.observe(parent);
     return () => ro.disconnect();
@@ -276,6 +336,7 @@ function OIPanel({ data }: { data: any }) {
 // Backend DerivativesState: { snapshots: [{exchange, fundingRate, nextFundingTime, ...}], avgFundingRate, cascadeRisk, ... }
 function FundingPanel({ data }: { data: any }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [rev, setRev] = useState(0); // bumpé au resize pour forcer un redraw net
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -407,7 +468,7 @@ function FundingPanel({ data }: { data: any }) {
     ctx.textAlign = 'right';
     ctx.fillText(riskLevel, W - pad, y + 10);
 
-  }, [data]);
+  }, [data, rev]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -418,6 +479,7 @@ function FundingPanel({ data }: { data: any }) {
       const r = parent.getBoundingClientRect();
       canvas.style.width = `${r.width}px`;
       canvas.style.height = `${r.height}px`;
+      setRev(v => v + 1); // redessine à la nouvelle taille (sinon flou jusqu'au prochain tick)
     });
     ro.observe(parent);
     return () => ro.disconnect();
@@ -434,6 +496,7 @@ function FundingPanel({ data }: { data: any }) {
 // Backend DerivativesState: { basisData: [{exchange, perpPrice, spotPrice, basis, basisPercent, ...}], avgBasisPercent, ... }
 function BasisPanel({ data }: { data: any }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [rev, setRev] = useState(0); // bumpé au resize pour forcer un redraw net
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -541,7 +604,7 @@ function BasisPanel({ data }: { data: any }) {
       y + 10
     );
 
-  }, [data]);
+  }, [data, rev]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -552,6 +615,7 @@ function BasisPanel({ data }: { data: any }) {
       const r = parent.getBoundingClientRect();
       canvas.style.width = `${r.width}px`;
       canvas.style.height = `${r.height}px`;
+      setRev(v => v + 1); // redessine à la nouvelle taille (sinon flou jusqu'au prochain tick)
     });
     ro.observe(parent);
     return () => ro.disconnect();
