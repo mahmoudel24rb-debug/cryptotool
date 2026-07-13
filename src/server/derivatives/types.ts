@@ -5,8 +5,19 @@ export interface DerivativesSnapshot {
   openInterest: number;         // USD
   openInterestChange: number;   // change since last snapshot
   openInterestChangePct: number;
+  oiDelta24hPct: number | null; // OI change over trailing 24h (null if no baseline)
   fundingRate: number;          // current funding rate (per 8h)
   nextFundingTime: number;      // timestamp of next funding
+}
+
+/** Positionnement des comptes : ratio long/short d'une source donnée. */
+export interface LongShortData {
+  source: string;   // 'BINANCE_GLOBAL' | 'BINANCE_TOP' | 'OKX'
+  label: string;    // libellé lisible (ex. « Retail Binance », « Top traders »)
+  ratio: number;    // longs / shorts (>1 = plus de longs)
+  longPct: number;  // 0..100
+  shortPct: number; // 0..100
+  timestamp: number;
 }
 
 export interface OIAlert {
@@ -73,6 +84,14 @@ export interface DerivativesState {
   aggregateOI: number;
   aggregateOIChange: number;
   aggregateOIChangePct: number;
+  // Δ OI sur 24h glissantes — reconstruit depuis l'historique REST des exchanges,
+  // pas depuis le buffer mémoire (qui ne couvre que ~30 min).
+  oiDelta24h: number;            // USD, somme des exchanges couverts
+  oiDelta24hPct: number | null;  // % moyen pondéré par l'OI (null si aucune baseline)
+  oiDelta24hCoverage: string[];  // exchanges effectivement inclus dans la baseline 24h
+  // Positionnement des comptes (ratios long/short)
+  longShort: LongShortData[];
+  avgLongShortRatio: number;     // moyenne des sources disponibles (0 si aucune)
   avgFundingRate: number;
   maxFundingRate: number;
   minFundingRate: number;

@@ -41,6 +41,8 @@ export interface RiskDeskContext {
   derivatives?: {
     avgFundingRate: number;
     aggregateOIChangePct: number;
+    oiDelta24hPct?: number | null;   // Δ OI sur 24h : construction (+) vs débouclage (-)
+    longShortRatios?: { label: string; ratio: number; longPct: number }[];
     avgBasisPercent: number;
     cascadeRisk: string | number;
   } | null;
@@ -114,7 +116,7 @@ Un moteur de confluence orderflow te soumet un scénario de trade avec son conte
 Critères d'évaluation :
 - Qualité de la zone d'entrée : niveau structurel net (OB/sweep/FVG) ou zone floue ?
 - Régime de marché : en TENDANCE établie, privilégie les continuations ; mais méfie-toi des entrées TARDIVES dans le sens d'un mouvement déjà très étendu (prix loin du VWAP, plusieurs heures de directionnel) — c'est souvent le sommet/creux local. En RANGE ou après extension, un setup contre-tendance sur un niveau structurel avec absorption peut être exactement le bon trade.
-- Dérivés : le funding, l'open interest et le basis confirment-ils ou contredisent-ils la direction ?
+- Dérivés : le funding, l'open interest et le basis confirment-ils ou contredisent-ils la direction ? Distingue le Δ OI sur 24h (oiDelta24hPct) — des positions qui SE CONSTRUISENT (+) pendant un basis qui se dégrade est une lecture opposée à des positions qui SE DÉBOUCLENT (-). Croise avec le long/short ratio (longShortRatios) : un basis en discount + OI en hausse + comptes majoritairement longs = risque de purge des longs en retard.
 - Risque d'invalidation rapide : le SL survivrait-il au bruit normal du timeframe ?
 - Historique du template : un template qui perd historiquement mérite la sévérité.
 

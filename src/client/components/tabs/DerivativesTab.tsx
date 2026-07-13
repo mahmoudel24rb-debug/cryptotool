@@ -3,6 +3,13 @@ import { useGlobalState } from '../../hooks/useGlobalState';
 import Chart from '../Chart';
 import ActivityLog from '../ActivityLog';
 
+const EXCHANGE_SHORT: Record<string, string> = {
+  BINANCE_FUTURES: 'BIN',
+  BYBIT: 'BYB',
+  OKX: 'OKX',
+  HYPERLIQUID: 'HYP',
+};
+
 export default function DerivativesTab() {
   const { state } = useGlobalState();
 
@@ -95,10 +102,13 @@ function OIPanel({ data }: { data: any }) {
       if (snap.openInterest > maxOI) maxOI = snap.openInterest;
     }
 
+    // Bars laissent de la place à droite pour le badge Δ 24h.
+    const barMaxW = (W - pad * 2) * 0.58;
+
     // Per-exchange rows
     for (const snap of oiSnapshots) {
       const v = snap.openInterest || 0;
-      const changePct = snap.openInterestChangePct || 0;
+      const d24 = snap.oiDelta24hPct; // % sur 24h glissantes, ou null si pas de baseline
 
       // Exchange name
       ctx.fillStyle = '#9ca3af';
@@ -114,25 +124,23 @@ function OIPanel({ data }: { data: any }) {
       y += 14;
 
       // Bar
-      const barW = maxOI > 0 ? ((v / maxOI) * (W - pad * 2)) : 0;
+      const barW = maxOI > 0 ? ((v / maxOI) * barMaxW) : 0;
       ctx.fillStyle = '#ff6b3530';
-      ctx.fillRect(pad, y, W - pad * 2, 8);
+      ctx.fillRect(pad, y, barMaxW, 8);
       ctx.fillStyle = '#ff6b35';
       ctx.fillRect(pad, y, barW, 8);
 
-      // Change badge
-      if (changePct !== 0) {
-        const changeColor = changePct > 0 ? '#22c55e' : '#ef4444';
-        const changeStr = `${changePct > 0 ? '+' : ''}${changePct.toFixed(1)}%`;
-        ctx.fillStyle = changeColor;
+      // Δ 24h badge, aligné à droite (positions qui se construisent/dénouent)
+      if (d24 !== null && d24 !== undefined) {
+        ctx.fillStyle = d24 > 0.05 ? '#22c55e' : d24 < -0.05 ? '#ef4444' : '#9ca3af';
         ctx.font = '8px monospace';
-        ctx.textAlign = 'left';
-        ctx.fillText(changeStr, pad + barW + 4, y + 7);
+        ctx.textAlign = 'right';
+        ctx.fillText(`${d24 > 0 ? '+' : ''}${d24.toFixed(1)}% 24h`, W - pad, y + 7);
       }
       y += 16;
     }
 
-    y += 8;
+    y += 6;
 
     // Total from aggregate
     const totalOI = data.aggregateOI || 0;
@@ -145,14 +153,100 @@ function OIPanel({ data }: { data: any }) {
     ctx.font = 'bold 12px monospace';
     ctx.textAlign = 'right';
     ctx.fillText(formatBigNumber(totalOI), W - pad, y + 10);
+    y += 15;
 
-    if (totalChange !== 0) {
-      y += 16;
-      const changeColor = totalChange > 0 ? '#22c55e' : '#ef4444';
-      ctx.fillStyle = changeColor;
-      ctx.font = 'bold 10px monospace';
+    // Δ court terme (~1 min) — repère instantané, volontairement discret
+    ctx.fillStyle = '#6b7280';
+    ctx.font = '8px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('Δ 1m:', pad, y + 8);
+    const stColor = totalChange > 0 ? '#4b8f5f' : totalChange < 0 ? '#9f5757' : '#6b7280';
+    ctx.fillStyle = stColor;
+    ctx.textAlign = 'right';
+    ctx.fillText(`${totalChange > 0 ? '+' : ''}${totalChange.toFixed(2)}%`, W - pad, y + 8);
+    y += 16;
+
+    // Δ 24h — la vraie lecture : construction vs débouclage
+    const d24Agg = data.oiDelta24hPct; // number | null
+    const d24Usd = data.oiDelta24h || 0;
+    ctx.fillStyle = '#e5e7eb';
+    ctx.font = 'bold 10px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('Δ 24h:', pad, y + 9);
+    if (d24Agg === null || d24Agg === undefined) {
+      ctx.fillStyle = '#6b7280';
+      ctx.font = '9px monospace';
+      ctx.textAlign = 'right';
+      ctx.fillText('baseline…', W - pad, y + 9);
+      y += 15;
+    } else {
+      const dColor = d24Agg > 0.1 ? '#22c55e' : d24Agg < -0.1 ? '#ef4444' : '#9ca3af';
+      ctx.fillStyle = dColor;
+      ctx.font = 'bold 11px monospace';
+      ctx.textAlign = 'right';
+      const usdStr = `${d24Usd >= 0 ? '+' : '-'}${formatBigNumber(Math.abs(d24Usd))}`;
+      ctx.fillText(`${d24Agg > 0 ? '+' : ''}${d24Agg.toFixed(2)}%  ${usdStr}`, W - pad, y + 9);
+      y += 14;
+
+      // Verdict + couverture
+      const verdict = d24Agg > 0.3 ? '» positions se construisent'
+        : d24Agg < -0.3 ? '» positions se dénouent'
+        : '» positions stables';
+      ctx.fillStyle = dColor;
+      ctx.font = '8px monospace';
       ctx.textAlign = 'left';
-      ctx.fillText(`${totalChange > 0 ? '+' : ''}${totalChange.toFixed(2)}%`, pad, y + 10);
+      ctx.fillText(verdict, pad, y + 8);
+      const cov = Array.isArray(data.oiDelta24hCoverage) ? data.oiDelta24hCoverage : [];
+      if (cov.length > 0) {
+        ctx.fillStyle = '#4b5563';
+        ctx.textAlign = 'right';
+        ctx.fillText(cov.map((c: string) => (EXCHANGE_SHORT[c] || c.slice(0, 3))).join('·'), W - pad, y + 8);
+      }
+      y += 14;
+    }
+
+    // ── POSITIONING — Long/Short ratio ──
+    const ls = Array.isArray(data.longShort) ? data.longShort : [];
+    if (ls.length > 0) {
+      y += 4;
+      ctx.strokeStyle = '#1f2937';
+      ctx.beginPath();
+      ctx.moveTo(pad, y);
+      ctx.lineTo(W - pad, y);
+      ctx.stroke();
+      y += 8;
+
+      ctx.fillStyle = '#ff6b35';
+      ctx.font = 'bold 9px monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText('POSITIONING — LONG/SHORT', pad, y + 8);
+      y += 16;
+
+      for (const l of ls) {
+        const ratio = l.ratio || 0;
+        const longPct = Math.max(0, Math.min(100, l.longPct || 0));
+        // Libellé + ratio
+        ctx.fillStyle = '#9ca3af';
+        ctx.font = '8px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText(l.label, pad, y + 8);
+        ctx.fillStyle = ratio > 1 ? '#22c55e' : ratio < 1 ? '#ef4444' : '#9ca3af';
+        ctx.font = 'bold 9px monospace';
+        ctx.textAlign = 'right';
+        ctx.fillText(ratio.toFixed(2), W - pad, y + 8);
+        y += 11;
+        // Barre long (vert) / short (rouge)
+        const fullW = W - pad * 2;
+        const longW = (longPct / 100) * fullW;
+        ctx.fillStyle = '#22c55e';
+        ctx.fillRect(pad, y, longW, 5);
+        ctx.fillStyle = '#ef4444';
+        ctx.fillRect(pad + longW, y, fullW - longW, 5);
+        // Repère 50%
+        ctx.fillStyle = '#0a0e14';
+        ctx.fillRect(pad + fullW / 2 - 0.5, y, 1, 5);
+        y += 12;
+      }
     }
 
   }, [data]);

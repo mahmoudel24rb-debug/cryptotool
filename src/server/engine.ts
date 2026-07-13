@@ -289,6 +289,8 @@ export function startEngine(
       derivatives: lastDerivState ? {
         avgFundingRate: lastDerivState.avgFundingRate,
         aggregateOIChangePct: lastDerivState.aggregateOIChangePct,
+        oiDelta24hPct: lastDerivState.oiDelta24hPct,
+        longShortRatios: (lastDerivState.longShort as import('./derivatives/types').LongShortData[]).map(l => ({ label: l.label, ratio: l.ratio, longPct: l.longPct })),
         avgBasisPercent: lastDerivState.avgBasisPercent,
         cascadeRisk: lastDerivState.cascadeRisk,
       } : null,
@@ -1615,8 +1617,10 @@ export function startEngine(
     basisTracker.checkAlerts();
 
     const oiAgg = oiTracker.getAggregateOI();
+    const oi24h = oiTracker.getOI24hDelta();
     const latestOI = oiTracker.getLatestOI();
     const latestFunding = fundingMonitor.getLatestRates();
+    const longShort = oiTracker.getLongShort();
 
     // Build per-exchange snapshots
     const exchangeKeys = new Set([...latestOI.keys(), ...latestFunding.keys()]);
@@ -1624,11 +1628,13 @@ export function startEngine(
     for (const ex of exchangeKeys) {
       const oi = latestOI.get(ex) || 0;
       const fundingSnap = latestFunding.get(ex);
+      const d24 = oi24h.perExchangePct.has(ex) ? oi24h.perExchangePct.get(ex)! : null;
       snapshots.push({
         exchange: ex,
         symbol: config.symbol || 'BTC',
         timestamp: Date.now(),
         openInterest: oi,
+        oiDelta24hPct: d24,
         fundingRate: fundingSnap?.rate || 0,
         nextFundingTime: fundingSnap?.nextFundingTime || 0,
       });
@@ -1646,6 +1652,11 @@ export function startEngine(
       aggregateOI: oiAgg.total,
       aggregateOIChange: oiAgg.change,
       aggregateOIChangePct: oiAgg.changePct,
+      oiDelta24h: oi24h.deltaUsd,
+      oiDelta24hPct: oi24h.deltaPct,
+      oiDelta24hCoverage: oi24h.coverage,
+      longShort,
+      avgLongShortRatio: oiTracker.getAvgLongShortRatio(),
       avgFundingRate: fundingMonitor.getAvgRate(),
       maxFundingRate: maxFunding,
       minFundingRate: minFunding,
