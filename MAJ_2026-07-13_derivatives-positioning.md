@@ -1,6 +1,7 @@
 # MAJ 2026-07-13 — Onglet Derivatives : positionnement (Long/Short + Δ OI 24h)
 
-Commit : `3eaaed8` · Service Railway : `mackuant` (production) · 5 fichiers, +330 / −19
+Commits : `3eaaed8` (feature) · `bb3e6b3` (correctif d'affichage) · doc `5af9183`
+Service Railway : `mackuant` (production) — **déployé et live**
 
 ---
 
@@ -127,6 +128,31 @@ typique de risque de purge des longs. Exactement le signal recherché.
 
 ---
 
+## Correctif d'affichage — suite au test en prod (commit `bb3e6b3`)
+
+En usage réel, la colonne OPEN INTEREST ayant grandi (Δ 24h + section
+POSITIONING), les panneaux **canvas à hauteur fixe** coupaient le bas de la
+colonne **sans scroll possible**, et l'Activity Log en bas mangeait l'espace.
+
+Trois corrections dans `DerivativesTab.tsx` :
+
+- **Grille de panneaux scrollable** : hauteur de contenu minimale de **360 px**.
+  En dessous, la grille **défile verticalement** au lieu de rogner le bas — le
+  bloc POSITIONING reste toujours atteignable.
+- **Splitter redimensionnable** au-dessus du journal : on glisse la poignée
+  (`ns-resize`) pour régler sa hauteur entre **90 et 520 px**, vers le haut =
+  plus grand, vers le bas = plus petit. Un chevron `▼/▲` le **replie sur son
+  en-tête** (34 px) pour libérer un maximum de place, puis le redéploie.
+- **Redraw net au resize** : chaque panneau canvas se redessine immédiatement
+  quand sa cellule change de taille (le `ResizeObserver` incrémente un compteur
+  `rev` injecté dans les dépendances de l'effet de dessin), au lieu d'attendre
+  le prochain tick data (10 s) et de rester flou/étiré entre-temps.
+
+Rappel : Railway sert le nouveau build après redémarrage du conteneur ; un
+rafraîchissement forcé du navigateur (Ctrl+F5) évite l'ancien bundle en cache.
+
+---
+
 ## Fichiers touchés
 
 | Fichier | Rôle |
@@ -135,4 +161,4 @@ typique de risque de purge des longs. Exactement le signal recherché.
 | `src/server/derivatives/types.ts` | Types `LongShortData`, champs 24h + long/short sur `DerivativesState` et `DerivativesSnapshot` |
 | `src/server/engine.ts` | Câblage dans le broadcast dérivés + contexte Risk Desk |
 | `src/server/llm/riskDesk.ts` | Type de contexte étendu + hint de prompt (build/unwind + positionnement) |
-| `src/client/components/tabs/DerivativesTab.tsx` | Rendu : Δ 1m rétrogradé, Δ 24h + verdict + couverture, section POSITIONING long/short |
+| `src/client/components/tabs/DerivativesTab.tsx` | Rendu : Δ 1m rétrogradé, Δ 24h + verdict + couverture, section POSITIONING long/short. **+ correctif `bb3e6b3`** : grille scrollable (min 360 px), splitter redimensionnable/repliable pour le journal, redraw canvas au resize |
